@@ -123,6 +123,7 @@ impl Activation {
         &mut self,
         qh: &QueueHandle<App>,
         object: TaskObjectId,
+        package: &str,
         app_id: &str,
         surface: Option<&WlSurface>,
     ) {
@@ -138,14 +139,14 @@ impl Activation {
         // A notification tap in the host shell already proved the user asked
         // for this app. Android input never reached the host, so a token
         // minted here would carry no serial and be denied.
-        if let Some(token) = self.host_grants.take(app_id) {
+        if let Some(token) = self.host_grants.take(package) {
             if let Some(token) = self.tokens.complete(object, generation, token)
                 && let Some(surface) = surface
             {
                 manager.activate(token, surface);
             }
             eprintln!(
-                "Droidloom used the host's notification activation: task object={} package={app_id}",
+                "Droidloom used the host's notification activation: task object={} package={package}",
                 object.0
             );
             return;
@@ -164,7 +165,7 @@ impl Activation {
         // recent input serial. Never manufacture focus or replay Android input.
         token.commit();
         eprintln!(
-            "Droidloom requested host activation: task object={} package={app_id}",
+            "Droidloom requested host activation: task object={} package={package}",
             object.0
         );
     }

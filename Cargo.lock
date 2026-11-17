@@ -899,6 +899,7 @@ dependencies = [
  "droidloom-syncobj",
  "droidloom-timing",
  "droidloom-window-policy",
+ "flate2",
  "futures-lite",
  "gbm",
  "hex",

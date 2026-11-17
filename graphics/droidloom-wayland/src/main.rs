@@ -19,10 +19,10 @@ mod presentation_audit;
 mod readiness;
 mod resize;
 mod text_input;
+mod toplevel_icon;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
-use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::num::NonZeroU32;
@@ -120,7 +120,6 @@ const SCROLL_IDLE_TIMEOUT: Duration = Duration::from_millis(85);
 const SCROLL_SLOP_LOGICAL: f64 = 9.0;
 const SCROLL_MIN_COMMIT_LOGICAL: f64 = 12.0;
 const SCROLL_EDGE_MARGIN: f64 = 16.0;
-const MAX_DESKTOP_ENTRY_BYTES: u64 = 64 * 1024;
 const FRACTIONAL_SCALE_DENOMINATOR: u32 = 120;
 const MAX_BUFFER_DIMENSION: u32 = 16_384;
 
@@ -266,9 +265,11 @@ struct TaskWindow {
     timeline: frame_timeline::Timeline,
     layers: Option<layers::Stream>,
     package: String,
+    app_id: String,
     android_task: Option<u64>,
     input_route: Option<input::Route>,
     window: Option<Window>,
+    toplevel_icon: Option<toplevel_icon::TaskIcon>,
     viewport: Option<WpViewport>,
     fractional_scale: Option<WpFractionalScaleV1>,
     sync_surface: Option<WpLinuxDrmSyncobjSurfaceV1>,
@@ -391,6 +392,7 @@ struct App {
     feedback: Option<DmabufFeedback>,
     compositor: CompositorState,
     xdg_shell: XdgShell,
+    toplevel_icon_manager: toplevel_icon::Manager,
     insets_manager: Option<insets::DenialInsetsManagerV1>,
     frame_timeline_manager: Option<frame_timeline::Manager>,
     clock: clock::Clock,
@@ -852,6 +854,8 @@ impl App {
         if !headless && let Err(error) = self.window_policy.reload_policy() {
             eprintln!("Droidloom kept the last valid window policy: {error}");
         }
+        let mut app_id = package.to_owned();
+        let mut toplevel_icon = None;
         let (window, viewport, fractional_scale, sync_surface) = if headless {
             (None, None, None, None)
         } else {
@@ -861,9 +865,25 @@ impl App {
                 SessionMode::Mobile => WindowDecorations::None,
             };
             let window = self.xdg_shell.create_window(surface, decorations, qh);
-            window.set_title(desktop_title_for_package(package));
-            window.set_app_id(package.to_owned());
+            let desktop = toplevel_icon::desktop_entry_for_package(package);
+            let title = desktop
+                .as_ref()
+                .and_then(|entry| entry.title.clone())
+                .unwrap_or_else(|| package.to_owned());
+            if let Some(entry) = &desktop {
+                app_id = entry.desktop_id.clone();
+            }
+            window.set_title(title);
+            window.set_app_id(app_id.clone());
             window.set_min_size(Some((1, 1)));
+            if let Some(icon_name) = desktop.as_ref().and_then(|entry| entry.icon.as_deref()) {
+                toplevel_icon = self.toplevel_icon_manager.attach(
+                    qh,
+                    &self.layer_globals.shm,
+                    window.xdg_toplevel(),
+                    icon_name,
+                );
+            }
             if let Some(manager) = &self.insets_manager {
                 manager.set_self_managed(window.wl_surface());
             }
@@ -897,9 +917,11 @@ impl App {
                 ),
                 layers: None,
                 package: package.to_owned(),
+                app_id,
                 android_task: None,
                 input_route: None,
                 window,
+                toplevel_icon,
                 viewport,
                 fractional_scale,
                 sync_surface,
@@ -1679,6 +1701,9 @@ impl App {
             if let Some(inhibitor) = task.idle_inhibitor.take() {
                 inhibitor.destroy();
             }
+            if let Some(toplevel_icon) = task.toplevel_icon.take() {
+                toplevel_icon.destroy();
+            }
             for (_, target) in task.targets {
                 if let Some(buffer) = target.wayland {
                     buffer.destroy();
@@ -1729,6 +1754,9 @@ impl App {
         }
         if let Some(inhibitor) = task.idle_inhibitor.take() {
             inhibitor.destroy();
+        }
+        if let Some(toplevel_icon) = task.toplevel_icon.take() {
+            toplevel_icon.destroy();
         }
         // Window is reference counted by SCTK. Taking our handle below does
         // not guarantee that WindowInner is dropped here, so relying on Drop
@@ -1886,7 +1914,8 @@ impl App {
                         .filter(|task| task.accepts_present())
                 {
                     let surface = task.window.as_ref().map(|window| window.wl_surface());
-                    self.activation.request(qh, object, &task.package, surface);
+                    self.activation
+                        .request(qh, object, &task.package, &task.app_id, surface);
                 }
             }
             EndpointAction::BindLayerStream { object, sockets } => {
@@ -3812,6 +3841,7 @@ fn run() -> Result<(), PresenterError> {
         feedback: None,
         compositor,
         xdg_shell,
+        toplevel_icon_manager: toplevel_icon::Manager::bind(&globals, &qh),
         insets_manager: globals.bind(&qh, 1..=1, ()).ok(),
         frame_timeline_manager: globals.bind(&qh, 1..=1, ()).ok(),
         clock: clock::Clock::new(),
@@ -4438,63 +4468,6 @@ fn scroll_anchor(
     (x, y)
 }
 
-fn desktop_applications_dir(data_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
-    data_home
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| {
-            home.map(PathBuf::from)
-                .filter(|path| path.is_absolute())
-                .map(|path| path.join(".local/share"))
-        })
-        .map(|root| root.join("applications"))
-}
-
-fn desktop_title_for_package(package: &str) -> String {
-    desktop_applications_dir(env::var_os("XDG_DATA_HOME"), env::var_os("HOME"))
-        .and_then(|dir| desktop_title_in_dir(&dir, package))
-        .unwrap_or_else(|| package.to_owned())
-}
-
-fn desktop_title_in_dir(dir: &Path, package: &str) -> Option<String> {
-    let entries = fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.starts_with("droidloom-") || !name.ends_with(".desktop") {
-            continue;
-        }
-        let path = entry.path();
-        let Ok(meta) = fs::metadata(&path) else { continue };
-        if !meta.is_file() || meta.len() > MAX_DESKTOP_ENTRY_BYTES {
-            continue;
-        }
-        let Ok(content) = fs::read_to_string(&path) else { continue };
-        let mut in_entry = false;
-        let mut app_name: Option<&str> = None;
-        let mut matched_package = false;
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                in_entry = trimmed == "[Desktop Entry]";
-                continue;
-            }
-            if !in_entry {
-                continue;
-            }
-            if let Some(value) = trimmed.strip_prefix("Name=") {
-                app_name = (!value.is_empty()).then_some(value);
-            } else if trimmed.strip_prefix("X-Droidloom-Package=") == Some(package) {
-                matched_package = true;
-            }
-        }
-        if matched_package && let Some(title) = app_name {
-            return Some(title.to_owned());
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod output_power_test;
 
@@ -4731,21 +4704,5 @@ mod tests {
             ..AxisScroll::default()
         };
         assert!((axis_delta(discrete_wheel, true) + 112.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn desktop_title_lookup_reads_matching_entry_and_ignores_actions() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("droidloom-fdroid.desktop");
-        fs::write(
-            &file,
-            "[Desktop Entry]\nType=Application\nName=F-Droid\nX-Droidloom-Package=org.fdroid.fdroid\n\n[Desktop Action Extra]\nName=Wrong\n",
-        )
-        .unwrap();
-        assert_eq!(
-            desktop_title_in_dir(dir.path(), "org.fdroid.fdroid"),
-            Some("F-Droid".to_owned())
-        );
-        assert_eq!(desktop_title_in_dir(dir.path(), "com.example.missing"), None);
     }
 }

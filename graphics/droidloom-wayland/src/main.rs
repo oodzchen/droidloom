@@ -22,6 +22,7 @@ mod text_input;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::num::NonZeroU32;
@@ -58,7 +59,9 @@ use smithay_client_toolkit::registry_handlers;
 use smithay_client_toolkit::seat::keyboard::{
     KeyEvent, KeyboardHandler, Modifiers, RawModifiers, RepeatInfo,
 };
-use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
+use smithay_client_toolkit::seat::pointer::{
+    AxisScroll, PointerEvent, PointerEventKind, PointerHandler,
+};
 use smithay_client_toolkit::seat::touch::TouchHandler;
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::WaylandSurface;
@@ -107,6 +110,17 @@ const RELEASE_POLL_FALLBACK: Duration = Duration::from_millis(4);
 /// the frame that takes its buffers off the window.
 const HIDE_GRACE: Duration = Duration::from_millis(250);
 const LEFT_BUTTON: u32 = 0x110;
+const RIGHT_BUTTON: u32 = 0x111;
+const SIDE_BUTTON: u32 = 0x113;
+const EXTRA_BUTTON: u32 = 0x114;
+const EVDEV_KEY_BACK: u32 = 158;
+const EVDEV_KEY_FORWARD: u32 = 159;
+const SCROLL_POINTER_ID: u32 = u32::MAX - 1;
+const SCROLL_IDLE_TIMEOUT: Duration = Duration::from_millis(85);
+const SCROLL_SLOP_LOGICAL: f64 = 9.0;
+const SCROLL_MIN_COMMIT_LOGICAL: f64 = 12.0;
+const SCROLL_EDGE_MARGIN: f64 = 16.0;
+const MAX_DESKTOP_ENTRY_BYTES: u64 = 64 * 1024;
 const FRACTIONAL_SCALE_DENOMINATOR: u32 = 120;
 const MAX_BUFFER_DIMENSION: u32 = 16_384;
 
@@ -337,6 +351,14 @@ impl Contact {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ScrollGesture {
+    object: TaskObjectId,
+    virtual_pos: (f64, f64),
+    max_travel: f64,
+    deadline: Instant,
+}
+
 // A cancelled/replaced shared stream also invalidates contacts waiting behind
 // clipboard synchronization. Preserve keyboard events, which are independent.
 fn clear_contact_state(
@@ -381,6 +403,7 @@ struct App {
     /// only when the compositor offers no linear buffers.
     gpu_targets: std::cell::OnceCell<Option<gpu_layouts::Targets>>,
     listener: DenialEndpointListener,
+    session_mode: SessionMode,
     window_policy: WindowPolicyStore,
     /// The density each task gets on the output it is on.
     densities: density::Densities,
@@ -395,6 +418,8 @@ struct App {
     touch: Option<wl_touch::WlTouch>,
     focused: Option<TaskObjectId>,
     pointer_contact: Option<Contact>,
+    scroll_gesture: Option<ScrollGesture>,
+    pressed_nav_button: Option<(TaskObjectId, u32)>,
     touch_contacts: BTreeMap<i32, Contact>,
     // Touch and mouse share Android's injected pointer device; keys are separate.
     motion_times: input_time::Stream,
@@ -831,10 +856,12 @@ impl App {
             (None, None, None, None)
         } else {
             let surface = self.compositor.create_surface(qh);
-            let window = self
-                .xdg_shell
-                .create_window(surface, WindowDecorations::None, qh);
-            window.set_title(package.to_owned());
+            let decorations = match self.session_mode {
+                SessionMode::Desktop => WindowDecorations::RequestServer,
+                SessionMode::Mobile => WindowDecorations::None,
+            };
+            let window = self.xdg_shell.create_window(surface, decorations, qh);
+            window.set_title(desktop_title_for_package(package));
             window.set_app_id(package.to_owned());
             window.set_min_size(Some((1, 1)));
             if let Some(manager) = &self.insets_manager {
@@ -1993,10 +2020,14 @@ impl App {
         }
         self.focused = None;
         self.pointer_contact = None;
+        self.scroll_gesture = None;
+        self.pressed_nav_button = None;
         self.touch_contacts.clear();
     }
 
     fn clear_contacts(&mut self) {
+        self.scroll_gesture = None;
+        self.pressed_nav_button = None;
         clear_contact_state(
             &mut self.pointer_contact,
             &mut self.touch_contacts,
@@ -2006,6 +2037,12 @@ impl App {
 
     fn retire_contacts(&mut self, object: Option<TaskObjectId>) {
         if let Some(object) = object {
+            if self
+                .pressed_nav_button
+                .is_some_and(|(owner, _)| owner == object)
+            {
+                self.pressed_nav_button = None;
+            }
             let route = self.tasks.get(&object).and_then(|task| task.input_route);
             if let Some(route) = route {
                 match monotonic_timestamp_nanos() {
@@ -2023,6 +2060,9 @@ impl App {
             if !self
                 .pointer_contact
                 .is_some_and(|contact| contact.object == object)
+                && !self
+                    .scroll_gesture
+                    .is_some_and(|scroll| scroll.object == object)
                 && !self
                     .touch_contacts
                     .values()
@@ -2053,6 +2093,13 @@ impl App {
         } else if self.endpoint.is_some() {
             let mut contacts: Vec<_> = self.touch_contacts.values().copied().collect();
             contacts.extend(self.pointer_contact);
+            if let Some(scroll) = self.scroll_gesture {
+                contacts.push(Contact {
+                    object: scroll.object,
+                    pointer_id: SCROLL_POINTER_ID,
+                    position_fixed: self.fixed_position(scroll.object, scroll.virtual_pos),
+                });
+            }
             // Legacy policy groups by task. Every route needs retirement.
             contacts.sort_by_key(|contact| contact.object);
             contacts.dedup_by_key(|contact| contact.object);
@@ -2212,6 +2259,184 @@ impl App {
 
     fn hide_deadline(&self) -> Option<Instant> {
         self.tasks.values().filter_map(|task| task.hide_due).min()
+    }
+
+    fn scroll_deadline(&self) -> Option<Instant> {
+        self.scroll_gesture.map(|scroll| scroll.deadline)
+    }
+
+    fn expire_scroll(&mut self, now: Instant) -> Result<(), PresenterError> {
+        if self
+            .scroll_gesture
+            .is_some_and(|scroll| now >= scroll.deadline)
+        {
+            let timestamp = self.synthesized_time()?;
+            self.finish_scroll(true, timestamp)?;
+            self.pump_direct_input()?;
+        }
+        Ok(())
+    }
+
+    fn finish_scroll(&mut self, commit_up: bool, timestamp: u64) -> Result<(), PresenterError> {
+        let Some(scroll) = self.scroll_gesture.take() else {
+            return Ok(());
+        };
+        if !self.tasks.contains_key(&scroll.object) {
+            return Ok(());
+        }
+        let contact = Contact {
+            object: scroll.object,
+            pointer_id: SCROLL_POINTER_ID,
+            position_fixed: self.fixed_position(scroll.object, scroll.virtual_pos),
+        };
+        let action = if commit_up && scroll.max_travel >= SCROLL_MIN_COMMIT_LOGICAL {
+            TouchAction::Up
+        } else if self.pointer_contact.is_none() && self.touch_contacts.is_empty() {
+            TouchAction::Cancel
+        } else {
+            TouchAction::Up
+        };
+        self.send_input(scroll.object, contact.event(action), timestamp)?;
+        Ok(())
+    }
+
+    fn step_scroll(
+        &mut self,
+        object: TaskObjectId,
+        cursor: (f64, f64),
+        dx_scroll: f64,
+        dy_scroll: f64,
+        wheel: bool,
+        mut timestamp: u64,
+    ) -> Result<(), PresenterError> {
+        if self.pointer_contact.is_some() || !self.touch_contacts.is_empty() {
+            return Ok(());
+        }
+        let Some((logical_w, logical_h)) = self.tasks.get(&object).and_then(|t| t.logical_size)
+        else {
+            return Ok(());
+        };
+        if logical_w < 4 || logical_h < 4 {
+            return Ok(());
+        }
+        let (finger_dx, finger_dy) = (-dx_scroll, -dy_scroll);
+        let hypot = finger_dx.hypot(finger_dy);
+        if hypot < 0.01 {
+            return Ok(());
+        }
+        let (w, h) = (f64::from(logical_w), f64::from(logical_h));
+        let (mx, my) = (SCROLL_EDGE_MARGIN.min(w * 0.25), SCROLL_EDGE_MARGIN.min(h * 0.25));
+        if let Some(scroll) = self.scroll_gesture {
+            let next_x = scroll.virtual_pos.0 + finger_dx;
+            let next_y = scroll.virtual_pos.1 + finger_dy;
+            if scroll.object != object
+                || next_x < mx
+                || next_x > w - mx
+                || next_y < my
+                || next_y > h - my
+            {
+                self.finish_scroll(false, timestamp)?;
+                timestamp = timestamp.saturating_add(1);
+            }
+        }
+        if self.scroll_gesture.is_none() {
+            let anchor = scroll_anchor(cursor, (finger_dx, finger_dy), (w, h), (mx, my));
+            let down = Contact {
+                object,
+                pointer_id: SCROLL_POINTER_ID,
+                position_fixed: self.fixed_position(object, anchor),
+            };
+            if !self.send_input(object, down.event(TouchAction::Down), timestamp)? {
+                return Ok(());
+            }
+            let slop_dx = finger_dx / hypot * SCROLL_SLOP_LOGICAL;
+            let slop_dy = finger_dy / hypot * SCROLL_SLOP_LOGICAL;
+            let slop_pos = (
+                (anchor.0 + slop_dx).clamp(1.0, (w - 1.0).max(1.0)),
+                (anchor.1 + slop_dy).clamp(1.0, (h - 1.0).max(1.0)),
+            );
+            let slop_contact = Contact {
+                object,
+                pointer_id: SCROLL_POINTER_ID,
+                position_fixed: self.fixed_position(object, slop_pos),
+            };
+            timestamp = timestamp.saturating_add(1);
+            if !self.send_input(object, slop_contact.event(TouchAction::Motion), timestamp)? {
+                return Ok(());
+            }
+            self.scroll_gesture = Some(ScrollGesture {
+                object,
+                virtual_pos: slop_pos,
+                max_travel: slop_dx.hypot(slop_dy),
+                deadline: Instant::now() + SCROLL_IDLE_TIMEOUT,
+            });
+        }
+        let Some(scroll) = self.scroll_gesture else {
+            return Ok(());
+        };
+        let target_x = (scroll.virtual_pos.0 + finger_dx).clamp(1.0, (w - 1.0).max(1.0));
+        let target_y = (scroll.virtual_pos.1 + finger_dy).clamp(1.0, (h - 1.0).max(1.0));
+        if wheel {
+            let mid = (
+                0.5 * (scroll.virtual_pos.0 + target_x),
+                0.5 * (scroll.virtual_pos.1 + target_y),
+            );
+            let mid_contact = Contact {
+                object,
+                pointer_id: SCROLL_POINTER_ID,
+                position_fixed: self.fixed_position(object, mid),
+            };
+            timestamp = timestamp.saturating_add(1);
+            if !self.send_input(object, mid_contact.event(TouchAction::Motion), timestamp)? {
+                return Ok(());
+            }
+        }
+        let end_pos = (target_x, target_y);
+        let end_contact = Contact {
+            object,
+            pointer_id: SCROLL_POINTER_ID,
+            position_fixed: self.fixed_position(object, end_pos),
+        };
+        timestamp = timestamp.saturating_add(1);
+        if self.send_input(object, end_contact.event(TouchAction::Motion), timestamp)?
+            && let Some(active) = self.scroll_gesture.as_mut()
+        {
+            let step_hypot = (end_pos.0 - active.virtual_pos.0)
+                .hypot(end_pos.1 - active.virtual_pos.1);
+            active.virtual_pos = end_pos;
+            active.max_travel += step_hypot;
+            active.deadline = Instant::now() + SCROLL_IDLE_TIMEOUT;
+        }
+        Ok(())
+    }
+
+    fn send_nav_key(
+        &mut self,
+        object: TaskObjectId,
+        keycode: u32,
+        timestamp: u64,
+    ) -> Result<(), PresenterError> {
+        let sent = self.send_input(
+            object,
+            InputEvent::Key {
+                action: KeyAction::Down,
+                keycode,
+                repeat: 0,
+            },
+            timestamp,
+        )?;
+        if sent {
+            self.send_input(
+                object,
+                InputEvent::Key {
+                    action: KeyAction::Up,
+                    keycode,
+                    repeat: 0,
+                },
+                timestamp.saturating_add(1),
+            )?;
+        }
+        Ok(())
     }
 
     /// Stop suspended tasks whose composed frame did not arrive in time. Their
@@ -3130,6 +3355,14 @@ impl PointerHandler for App {
             let object = self.task_for_surface(&event.surface);
             match event.kind {
                 PointerEventKind::Press { button, time, .. } if button == LEFT_BUTTON => {
+                    if self.scroll_gesture.is_some()
+                        && let Err(error) = self
+                            .synthesized_time()
+                            .and_then(|ts| self.finish_scroll(false, ts))
+                    {
+                        self.fail(&error);
+                        return;
+                    }
                     if self.pointer_contact.is_some() {
                         self.retire_contacts(None);
                     }
@@ -3150,6 +3383,11 @@ impl PointerHandler for App {
                         Ok(true) => self.pointer_contact = Some(contact),
                         Ok(false) => {}
                     }
+                }
+                PointerEventKind::Press { button, .. }
+                    if matches!(button, RIGHT_BUTTON | SIDE_BUTTON | EXTRA_BUTTON) =>
+                {
+                    self.pressed_nav_button = object.map(|owner| (owner, button));
                 }
                 PointerEventKind::Motion { time } => {
                     let Some(mut contact) = self.pointer_contact else {
@@ -3196,6 +3434,81 @@ impl PointerHandler for App {
                         self.fail(&error);
                     }
                 }
+                PointerEventKind::Release { button, time, .. }
+                    if matches!(button, RIGHT_BUTTON | SIDE_BUTTON | EXTRA_BUTTON) =>
+                {
+                    if let Some((owner, pressed_button)) = self.pressed_nav_button.take()
+                        && pressed_button == button
+                        && object == Some(owner)
+                    {
+                        let keycode = if button == EXTRA_BUTTON {
+                            EVDEV_KEY_FORWARD
+                        } else {
+                            EVDEV_KEY_BACK
+                        };
+                        if let Err(error) = self
+                            .input_time(input_time::Device::Pointer, time)
+                            .and_then(|ts| self.send_nav_key(owner, keycode, ts))
+                        {
+                            self.fail(&error);
+                        }
+                    }
+                }
+                PointerEventKind::Axis {
+                    time,
+                    horizontal,
+                    vertical,
+                    source,
+                } => {
+                    let wheel = matches!(
+                        source,
+                        Some(
+                            wl_pointer::AxisSource::Wheel | wl_pointer::AxisSource::WheelTilt
+                        )
+                    );
+                    let dx = axis_delta(horizontal, wheel);
+                    let dy = axis_delta(vertical, wheel);
+                    let stops = horizontal.stop || vertical.stop;
+                    if (dx.abs() >= 0.01 || dy.abs() >= 0.01) || (stops && self.scroll_gesture.is_some()) {
+                        let ts = if time != 0 {
+                            self.input_time(input_time::Device::Pointer, time)
+                        } else {
+                            self.synthesized_time()
+                        };
+                        let result = ts.and_then(|mut timestamp| {
+                            if let Some(object) = object
+                                && (dx.abs() >= 0.01 || dy.abs() >= 0.01)
+                            {
+                                self.step_scroll(
+                                    object,
+                                    event.position,
+                                    dx,
+                                    dy,
+                                    wheel,
+                                    timestamp,
+                                )?;
+                                timestamp = timestamp.saturating_add(4);
+                            }
+                            if stops {
+                                self.finish_scroll(true, timestamp)?;
+                            }
+                            Ok(())
+                        });
+                        if let Err(error) = result {
+                            self.fail(&error);
+                        }
+                    }
+                }
+                PointerEventKind::Leave { .. } => {
+                    self.pressed_nav_button = None;
+                    if self.scroll_gesture.is_some()
+                        && let Err(error) = self
+                            .synthesized_time()
+                            .and_then(|ts| self.finish_scroll(true, ts))
+                    {
+                        self.fail(&error);
+                    }
+                }
                 _ => {}
             }
         }
@@ -3215,6 +3528,14 @@ impl TouchHandler for App {
         position: (f64, f64),
     ) {
         if self.touch.as_ref() != Some(_touch) {
+            return;
+        }
+        if self.scroll_gesture.is_some()
+            && let Err(error) = self
+                .synthesized_time()
+                .and_then(|ts| self.finish_scroll(false, ts))
+        {
+            self.fail(&error);
             return;
         }
         if id < 0 || self.touch_contacts.contains_key(&id) {
@@ -3501,6 +3822,7 @@ fn run() -> Result<(), PresenterError> {
         gbm,
         gpu_targets: std::cell::OnceCell::new(),
         listener,
+        session_mode,
         window_policy,
         densities: density::Densities::load(env::var_os("XDG_CONFIG_HOME"), env::var_os("HOME")),
         density_task: None,
@@ -3513,6 +3835,8 @@ fn run() -> Result<(), PresenterError> {
         touch: None,
         focused: None,
         pointer_contact: None,
+        scroll_gesture: None,
+        pressed_nav_button: None,
         touch_contacts: BTreeMap::new(),
         motion_times: input_time::Stream::default(),
         key_times: input_time::Stream::default(),
@@ -3620,9 +3944,11 @@ fn poll_sources(
     let now = Instant::now();
     app.report_stalled_scenes(now);
     app.hide_overdue(now)?;
+    app.expire_scroll(now)?;
     let fallback_deadline = app.task_work.deadline(now, RELEASE_POLL_FALLBACK);
     let stall_deadline = app.stalled_scene_deadline();
     let hide_deadline = app.hide_deadline();
+    let scroll_deadline = app.scroll_deadline();
     // Pending Wayland events must be dispatched before sleeping. The previous
     // fixed timeout masked a missed wakeup here when the socket was drained
     // by another reader but our event queue still contained callbacks.
@@ -3723,6 +4049,7 @@ fn poll_sources(
         .chain(fallback_deadline)
         .chain(stall_deadline)
         .chain(hide_deadline)
+        .chain(scroll_deadline)
         .min();
     let timeout = if app.task_work.pending() {
         0 // Flush Wayland first, then service work queued during this turn.
@@ -4074,6 +4401,100 @@ fn aggregate_display_power(states: impl IntoIterator<Item = Option<bool>>) -> Op
     (saw_output && !unknown).then_some(false)
 }
 
+fn axis_delta(axis: AxisScroll, wheel: bool) -> f64 {
+    if wheel {
+        if axis.value120 != 0 {
+            f64::from(axis.value120) / 120.0 * 56.0
+        } else if axis.discrete != 0 {
+            f64::from(axis.discrete) * 56.0
+        } else {
+            axis.absolute * 3.5
+        }
+    } else if axis.absolute != 0.0 {
+        axis.absolute * 1.4
+    } else if axis.value120 != 0 {
+        f64::from(axis.value120) / 120.0 * 56.0
+    } else {
+        0.0
+    }
+}
+
+fn scroll_anchor(
+    cursor: (f64, f64),
+    delta: (f64, f64),
+    size: (f64, f64),
+    margin: (f64, f64),
+) -> (f64, f64) {
+    let mut x = cursor.0.clamp(margin.0, (size.0 - margin.0).max(margin.0));
+    let mut y = cursor.1.clamp(margin.1, (size.1 - margin.1).max(margin.1));
+    let needed_x = delta.0.abs() + SCROLL_SLOP_LOGICAL + margin.0;
+    let needed_y = delta.1.abs() + SCROLL_SLOP_LOGICAL + margin.1;
+    if (delta.0 < -0.01 && x < needed_x) || (delta.0 > 0.01 && x + needed_x > size.0) {
+        x = (size.0 * 0.5).clamp(margin.0, (size.0 - margin.0).max(margin.0));
+    }
+    if (delta.1 < -0.01 && y < needed_y) || (delta.1 > 0.01 && y + needed_y > size.1) {
+        y = (size.1 * 0.5).clamp(margin.1, (size.1 - margin.1).max(margin.1));
+    }
+    (x, y)
+}
+
+fn desktop_applications_dir(data_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    data_home
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            home.map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|path| path.join(".local/share"))
+        })
+        .map(|root| root.join("applications"))
+}
+
+fn desktop_title_for_package(package: &str) -> String {
+    desktop_applications_dir(env::var_os("XDG_DATA_HOME"), env::var_os("HOME"))
+        .and_then(|dir| desktop_title_in_dir(&dir, package))
+        .unwrap_or_else(|| package.to_owned())
+}
+
+fn desktop_title_in_dir(dir: &Path, package: &str) -> Option<String> {
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("droidloom-") || !name.ends_with(".desktop") {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = fs::metadata(&path) else { continue };
+        if !meta.is_file() || meta.len() > MAX_DESKTOP_ENTRY_BYTES {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&path) else { continue };
+        let mut in_entry = false;
+        let mut app_name: Option<&str> = None;
+        let mut matched_package = false;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                in_entry = trimmed == "[Desktop Entry]";
+                continue;
+            }
+            if !in_entry {
+                continue;
+            }
+            if let Some(value) = trimmed.strip_prefix("Name=") {
+                app_name = (!value.is_empty()).then_some(value);
+            } else if trimmed.strip_prefix("X-Droidloom-Package=") == Some(package) {
+                matched_package = true;
+            }
+        }
+        if matched_package && let Some(title) = app_name {
+            return Some(title.to_owned());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod output_power_test;
 
@@ -4287,5 +4708,44 @@ mod tests {
         assert_eq!(presentation_refresh_period(0, 120_000).unwrap(), 8_333_333);
         assert!(presentation_timestamp_nanos(0, 1_000_000_000).is_err());
         assert!(presentation_refresh_period(0, 0).is_err());
+    }
+
+    #[test]
+    fn scroll_axis_delta_handles_touchpad_and_wheel_units() {
+        let touchpad = AxisScroll {
+            absolute: 12.5,
+            ..AxisScroll::default()
+        };
+        assert!((axis_delta(touchpad, false) - 17.5).abs() < 1e-6);
+
+        let hires_wheel = AxisScroll {
+            value120: 120,
+            discrete: 1,
+            absolute: 15.0,
+            ..AxisScroll::default()
+        };
+        assert!((axis_delta(hires_wheel, true) - 56.0).abs() < 1e-6);
+
+        let discrete_wheel = AxisScroll {
+            discrete: -2,
+            ..AxisScroll::default()
+        };
+        assert!((axis_delta(discrete_wheel, true) + 112.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn desktop_title_lookup_reads_matching_entry_and_ignores_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("droidloom-fdroid.desktop");
+        fs::write(
+            &file,
+            "[Desktop Entry]\nType=Application\nName=F-Droid\nX-Droidloom-Package=org.fdroid.fdroid\n\n[Desktop Action Extra]\nName=Wrong\n",
+        )
+        .unwrap();
+        assert_eq!(
+            desktop_title_in_dir(dir.path(), "org.fdroid.fdroid"),
+            Some("F-Droid".to_owned())
+        );
+        assert_eq!(desktop_title_in_dir(dir.path(), "com.example.missing"), None);
     }
 }

@@ -21,6 +21,7 @@ mod resize;
 mod scroll;
 mod text_input;
 mod titles;
+mod toplevel_icon;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
@@ -259,12 +260,14 @@ struct TaskWindow {
     timeline: frame_timeline::Timeline,
     layers: Option<layers::Stream>,
     package: String,
+    app_id: String,
     android_task: Option<u64>,
     input_route: Option<input::Route>,
     window: Option<Window>,
     /// Asks Denial to draw the titlebar. Held here, not by SCTK, so it can be
     /// destroyed before the toplevel as xdg-decoration requires.
     decoration: Option<ZxdgToplevelDecorationV1>,
+    toplevel_icon: Option<toplevel_icon::TaskIcon>,
     viewport: Option<WpViewport>,
     fractional_scale: Option<WpFractionalScaleV1>,
     sync_surface: Option<WpLinuxDrmSyncobjSurfaceV1>,
@@ -382,6 +385,7 @@ struct App {
     feedback: Option<DmabufFeedback>,
     compositor: CompositorState,
     xdg_shell: XdgShell,
+    toplevel_icon_manager: toplevel_icon::Manager,
     insets_manager: Option<insets::DenialInsetsManagerV1>,
     frame_timeline_manager: Option<frame_timeline::Manager>,
     clock: clock::Clock,
@@ -841,6 +845,8 @@ impl App {
         if !headless && let Err(error) = self.window_policy.reload_policy() {
             eprintln!("Droidloom kept the last valid window policy: {error}");
         }
+        let mut app_id = package.to_owned();
+        let mut toplevel_icon = None;
         let (window, decoration, viewport, fractional_scale, sync_surface) = if headless {
             (None, None, None, None, None)
         } else {
@@ -862,9 +868,21 @@ impl App {
                         decoration.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
                         decoration
                     });
+            let desktop = toplevel_icon::desktop_entry_for_package(package);
+            if let Some(entry) = &desktop {
+                app_id = entry.desktop_id.clone();
+            }
             window.set_title(self.titles.title(package));
-            window.set_app_id(package.to_owned());
+            window.set_app_id(app_id.clone());
             window.set_min_size(Some((1, 1)));
+            if let Some(icon_name) = desktop.as_ref().and_then(|entry| entry.icon.as_deref()) {
+                toplevel_icon = self.toplevel_icon_manager.attach(
+                    qh,
+                    &self.layer_globals.shm,
+                    window.xdg_toplevel(),
+                    icon_name,
+                );
+            }
             if let Some(manager) = &self.insets_manager {
                 manager.set_self_managed(window.wl_surface());
             }
@@ -899,10 +917,12 @@ impl App {
                 ),
                 layers: None,
                 package: package.to_owned(),
+                app_id,
                 android_task: None,
                 input_route: None,
                 window,
                 decoration,
+                toplevel_icon,
                 viewport,
                 fractional_scale,
                 sync_surface,
@@ -1687,6 +1707,9 @@ impl App {
             if let Some(inhibitor) = task.idle_inhibitor.take() {
                 inhibitor.destroy();
             }
+            if let Some(toplevel_icon) = task.toplevel_icon.take() {
+                toplevel_icon.destroy();
+            }
             for (_, target) in task.targets {
                 if let Some(buffer) = target.wayland {
                     buffer.destroy();
@@ -1737,6 +1760,9 @@ impl App {
         }
         if let Some(inhibitor) = task.idle_inhibitor.take() {
             inhibitor.destroy();
+        }
+        if let Some(toplevel_icon) = task.toplevel_icon.take() {
+            toplevel_icon.destroy();
         }
         // Window is reference counted by SCTK. Taking our handle below does
         // not guarantee that WindowInner is dropped here, so relying on Drop
@@ -1917,7 +1943,8 @@ impl App {
                         .filter(|task| task.accepts_present())
                 {
                     let surface = task.window.as_ref().map(|window| window.wl_surface());
-                    self.activation.request(qh, object, &task.package, surface);
+                    self.activation
+                        .request(qh, object, &task.package, &task.app_id, surface);
                 }
             }
             EndpointAction::BindLayerStream { object, sockets } => {
@@ -3611,6 +3638,7 @@ fn run() -> Result<(), PresenterError> {
         feedback: None,
         compositor,
         xdg_shell,
+        toplevel_icon_manager: toplevel_icon::Manager::bind(&globals, &qh),
         insets_manager: globals.bind(&qh, 1..=1, ()).ok(),
         frame_timeline_manager: globals.bind(&qh, 1..=1, ()).ok(),
         clock: clock::Clock::new(),

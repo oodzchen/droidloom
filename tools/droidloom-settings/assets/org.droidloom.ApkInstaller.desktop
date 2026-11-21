@@ -13,3 +13,4 @@ MimeType=application/vnd.android.package-archive;
 Categories=System;PackageManager;Qt;
 NoDisplay=false
 StartupNotify=true
+StartupWMClass=org.droidloom.ApkInstaller

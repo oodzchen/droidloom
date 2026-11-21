@@ -6,6 +6,7 @@ from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from .icons import load_brand_pixmap
 from .page_apps_apk import AppsApkPage
 from .page_diagnostics import DiagnosticsPage
 from .page_display_orientation import DisplayOrientationPage
@@ -58,12 +59,10 @@ class MainWindow(QtWidgets.QMainWindow):
         brand_row = QtWidgets.QHBoxLayout()
         brand_row.setContentsMargins(4, 2, 4, 6)
         brand_row.setSpacing(8)
-        icon_path = Path.home() / ".local/share/icons/hicolor/scalable/apps/org.droidloom.Settings.svg"
-        if not icon_path.is_file():
-            icon_path = Path(__file__).resolve().parents[2] / "assets/org.droidloom.Settings.svg"
-        if icon_path.is_file():
+        brand_pm = load_brand_pixmap(20, self.devicePixelRatioF())
+        if not brand_pm.isNull():
             icon_lbl = QtWidgets.QLabel()
-            icon_lbl.setPixmap(QtGui.QIcon(str(icon_path)).pixmap(20, 20))
+            icon_lbl.setPixmap(brand_pm)
             icon_lbl.setFixedSize(20, 20)
             brand_row.addWidget(icon_lbl)
         brand_lbl = QtWidgets.QLabel("Droidloom")

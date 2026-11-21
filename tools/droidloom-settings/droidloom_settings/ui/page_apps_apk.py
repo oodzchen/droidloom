@@ -8,6 +8,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..backend.control_client import ControlClient
 from ..backend.mime_assoc import (
+    is_apk_mime_icon_installed,
     is_droidloom_default_apk_handler,
     query_default_apk_handler,
     set_droidloom_default_apk_handler,
@@ -276,11 +277,19 @@ class AppsApkPage(QtWidgets.QWidget):
 
     def refresh_mime_status(self) -> None:
         handler = query_default_apk_handler()
-        if is_droidloom_default_apk_handler():
+        is_default = is_droidloom_default_apk_handler()
+        icon_ok = is_apk_mime_icon_installed()
+        if is_default and icon_ok:
             set_pill_tone(self.mime_pill, "已设为默认 .apk 打开程序", "ok")
+            self.mime_detail_lbl.setText(f"当前默认关联: {handler}（APK 文件图标已同步为 Droidloom）")
+        elif is_default and not icon_ok:
+            set_pill_tone(self.mime_pill, "已设为默认，但 APK 图标未同步", "warn")
+            self.mime_detail_lbl.setText(
+                f"当前默认关联: {handler}（点击“设为默认”按桌面标准同步 APK 图标）"
+            )
         else:
             set_pill_tone(self.mime_pill, "未关联为默认打开程序", "warn")
-        self.mime_detail_lbl.setText(f"当前默认关联: {handler or '(未设置)'}")
+            self.mime_detail_lbl.setText(f"当前默认关联: {handler or '(未设置)'}")
 
     def _set_default_mime(self) -> None:
         ok, msg = set_droidloom_default_apk_handler()

@@ -33,4 +33,4 @@ PySide6 (Qt 6) desktop control center, graphical APK installer, `.apk` MIME hand
 bash tools/droidloom-settings/install-user.sh
 ```
 
-This installs `droidloom-settings` and `droidloom-apk-installer` into `~/.local/bin/`, desktop entries into `~/.local/share/applications/`, the icon into `~/.local/share/icons/`, the orientation sync service into `~/.config/systemd/user/`, and sets `org.droidloom.ApkInstaller.desktop` as the default `.apk` opener.
+This installs `droidloom-settings` and `droidloom-apk-installer` into `~/.local/bin/`, desktop entries into `~/.local/share/applications/`, multi-size `hicolor` PNG/SVG icons (`16x16`–`512x512`, `@2`, `scalable`, both `apps` and `mimetypes`) into `~/.local/share/icons/hicolor/`, the Shared MIME-info icon association into `~/.local/share/mime/packages/org.droidloom.ApkInstaller.xml`, the orientation sync service into `~/.config/systemd/user/`, and sets `org.droidloom.ApkInstaller.desktop` as the default `.apk` opener.

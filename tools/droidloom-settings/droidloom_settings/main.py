@@ -39,19 +39,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.orientation_daemon:
         return run_orientation_daemon()
 
-    from PySide6 import QtGui, QtWidgets
+    from PySide6 import QtWidgets
     from .ui.apk_install_dialog import ApkInstallDialog
+    from .ui.icons import load_app_icon
     from .ui.main_window import MainWindow
     from .ui.widgets import wait_all_workers
 
     app = QtWidgets.QApplication([sys.argv[0]])
     app.aboutToQuit.connect(lambda: wait_all_workers(4000))
     app.setApplicationName("Droidloom Settings")
-    app.setDesktopFileName("org.droidloom.Settings")
+    desktop_id = "org.droidloom.ApkInstaller" if args.install_apk else "org.droidloom.Settings"
+    app.setDesktopFileName(desktop_id)
 
-    icon_path = Path.home() / ".local/share/icons/hicolor/scalable/apps/org.droidloom.Settings.svg"
-    if icon_path.is_file():
-        app.setWindowIcon(QtGui.QIcon(str(icon_path)))
+    app_icon = load_app_icon()
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
 
     if args.install_apk:
         apk_paths = [Path(p) for p in args.install_apk]

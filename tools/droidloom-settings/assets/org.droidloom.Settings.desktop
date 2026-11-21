@@ -12,3 +12,4 @@ Terminal=false
 Categories=System;Settings;Qt;
 Keywords=droidloom;android;settings;apk;network;storage;
 StartupNotify=true
+StartupWMClass=org.droidloom.Settings

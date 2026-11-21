@@ -311,7 +311,7 @@ droidloomctl stop
 droidloomctl start
 ```
 
-Startup is manual: app launch does not currently start a stopped runtime.
+Startup is manual on login unless `droidloom.service` is enabled, though `droidloomctl launch` (and exported desktop launchers) starts a stopped runtime automatically.
 Stopping releases the runtime's resources and closes its Android windows.
 
 To upgrade, install the new matching package pair with the same `pacman -U`

@@ -3,10 +3,12 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     io::Write,
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
@@ -14,7 +16,8 @@ use std::{
 use clap::{Parser, Subcommand, ValueEnum};
 use droidloom_supervisor::boot_notice::BootNotice;
 use droidloom_supervisor::control::{
-    ControlRequest, DEFAULT_CELL_SPEC, DEFAULT_CONTROL_SOCKET, request, request_with_progress,
+    ControlError, ControlRequest, ControlResponse, DEFAULT_CELL_SPEC, DEFAULT_CONTROL_SOCKET,
+    request, request_with_progress,
 };
 use droidloom_window_policy::{
     LogicalSize, SessionMode, WindowPolicyPaths, WindowPolicyStore, WindowPreference,
@@ -382,7 +385,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             response?
         } else {
-            request_with_progress(&cli.socket, &control_request, &mut report)?
+            let env_config = SessionEnvironment::from_process();
+            execute_control_request(
+                &cli.socket,
+                Path::new(DEFAULT_CONTROL_SOCKET),
+                Path::new(DEFAULT_CELL_SPEC),
+                cli.json,
+                &env_config,
+                &control_request,
+                &mut report,
+            )?
         }
     };
     if response.ok && wait_after_start {
@@ -483,13 +495,94 @@ fn gpu(choice: Option<&droidloom_supervisor::host_gpu::GpuChoice>) -> Result<(),
     Ok(())
 }
 
+struct SessionEnvironment {
+    package_managed: bool,
+    systemctl: PathBuf,
+    runtime_dir: Option<OsString>,
+    desktop_vars: Vec<(&'static str, OsString)>,
+}
+
+impl SessionEnvironment {
+    fn from_process() -> Self {
+        let desktop_vars = ["WAYLAND_DISPLAY", "DISPLAY", "XDG_CURRENT_DESKTOP"]
+            .into_iter()
+            .filter_map(|name| env::var_os(name).map(|value| (name, value)))
+            .collect();
+        Self {
+            package_managed: Path::new("/usr/share/droidloom/package.json").is_file(),
+            systemctl: PathBuf::from("systemctl"),
+            runtime_dir: env::var_os("XDG_RUNTIME_DIR"),
+            desktop_vars,
+        }
+    }
+}
+
+fn is_daemon_unreachable(error: &ControlError) -> bool {
+    matches!(
+        error,
+        ControlError::Io { context, source }
+            if context == "connect to droidloomd"
+                && matches!(
+                    source.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                )
+    )
+}
+
+fn execute_control_request(
+    socket: &Path,
+    default_socket: &Path,
+    default_spec: &Path,
+    json: bool,
+    env_config: &SessionEnvironment,
+    control_request: &ControlRequest,
+    report: &mut dyn FnMut(&str),
+) -> Result<ControlResponse, Box<dyn std::error::Error>> {
+    let auto_start = socket == default_socket
+        && matches!(
+            control_request,
+            ControlRequest::Launch { spec, .. } if spec == default_spec
+        );
+    if auto_start && !socket.exists() {
+        run_session_lifecycle("start", json, None, false, socket, env_config, false)?;
+    }
+    match request_with_progress(socket, control_request, report) {
+        Ok(response) => Ok(response),
+        Err(error) if auto_start && is_daemon_unreachable(&error) => {
+            run_session_lifecycle("start", json, None, false, socket, env_config, false)?;
+            Ok(request_with_progress(socket, control_request, report)?)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn session_lifecycle(
     operation: &str,
     json: bool,
     requested_mode: Option<SessionMode>,
     no_wait: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if operation != "stop" && PathBuf::from("/usr/share/droidloom/package.json").is_file() {
+    run_session_lifecycle(
+        operation,
+        json,
+        requested_mode,
+        no_wait,
+        Path::new(DEFAULT_CONTROL_SOCKET),
+        &SessionEnvironment::from_process(),
+        true,
+    )
+}
+
+fn run_session_lifecycle(
+    operation: &str,
+    json: bool,
+    requested_mode: Option<SessionMode>,
+    no_wait: bool,
+    socket: &Path,
+    env_config: &SessionEnvironment,
+    emit_result: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if operation != "stop" && env_config.package_managed {
         let status =
             droidloom_cpu_placement::command("/usr/lib/droidloom/droidloom-package-helper")
                 .arg("prepare")
@@ -497,7 +590,7 @@ fn session_lifecycle(
         if !status.success() {
             return Err("Droidloom setup did not complete; the runtime was not started".into());
         }
-        let status = droidloom_cpu_placement::command("systemctl")
+        let status = droidloom_cpu_placement::command(&env_config.systemctl)
             .args(["--user", "daemon-reload"])
             .status()?;
         if !status.success() {
@@ -506,8 +599,12 @@ fn session_lifecycle(
     }
     let mut operation = operation;
     if operation != "stop" {
-        let runtime =
-            PathBuf::from(env::var_os("XDG_RUNTIME_DIR").ok_or("XDG_RUNTIME_DIR is missing")?);
+        let runtime = PathBuf::from(
+            env_config
+                .runtime_dir
+                .as_ref()
+                .ok_or("XDG_RUNTIME_DIR is missing")?,
+        );
         if !runtime.is_absolute() {
             return Err("XDG_RUNTIME_DIR must be absolute".into());
         }
@@ -538,7 +635,7 @@ fn session_lifecycle(
         // A start with a different mode must actually change the running service.
         if operation == "start"
             && mode != previous
-            && droidloom_cpu_placement::command("systemctl")
+            && droidloom_cpu_placement::command(&env_config.systemctl)
                 .args(["--user", "is-active", "--quiet", "droidloom.service"])
                 .status()?
                 .success()
@@ -557,15 +654,13 @@ fn session_lifecycle(
     }
     // Import the caller's live session without requiring a logout after install.
     if operation != "stop" {
-        let variables: Vec<_> = ["WAYLAND_DISPLAY", "DISPLAY", "XDG_CURRENT_DESKTOP"]
-            .into_iter()
-            .filter(|name| env::var_os(name).is_some())
-            .collect();
-        if !variables.is_empty() {
-            let status = droidloom_cpu_placement::command("systemctl")
-                .args(["--user", "import-environment"])
-                .args(variables)
-                .status()?;
+        if !env_config.desktop_vars.is_empty() {
+            let mut command = droidloom_cpu_placement::command(&env_config.systemctl);
+            command.args(["--user", "import-environment"]);
+            for (name, _) in &env_config.desktop_vars {
+                command.arg(name);
+            }
+            let status = command.status()?;
             if !status.success() {
                 return Err("could not import the graphical session environment".into());
             }
@@ -574,7 +669,7 @@ fn session_lifecycle(
     if !json {
         eprintln!("Waiting for Droidloom services to {operation} (up to 160 seconds)...");
     }
-    let mut child = droidloom_cpu_placement::command("systemctl")
+    let mut child = droidloom_cpu_placement::command(&env_config.systemctl)
         .args(["--user", operation, "droidloom.service"])
         .spawn()?;
     let started = Instant::now();
@@ -611,7 +706,7 @@ fn session_lifecycle(
         "Droidloom services are running; Android readiness has not been checked. Use `droidloomctl wait` to follow boot progress."
     } else {
         let response = request_with_progress(
-            &PathBuf::from(DEFAULT_CONTROL_SOCKET),
+            socket,
             &ControlRequest::WaitReady,
             &mut |message| {
                 if !json {
@@ -624,13 +719,240 @@ fn session_lifecycle(
         }
         "Droidloom is running; Android is ready"
     };
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({"ok": true, "message": message, "state": if operation == "stop" { "stopped" } else { "running" }})
-        );
-    } else {
-        println!("{message}");
+    if emit_result {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"ok": true, "message": message, "state": if operation == "stop" { "stopped" } else { "running" }})
+            );
+        } else {
+            println!("{message}");
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+
+    fn spawn_mock_daemon(socket: PathBuf, expected_commands: Vec<&'static str>) -> thread::JoinHandle<()> {
+        let listener = UnixListener::bind(&socket).unwrap();
+        thread::spawn(move || {
+            for expected in expected_commands {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut bytes = Vec::new();
+                stream.read_to_end(&mut bytes).unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(request["request"]["command"], expected);
+                let mut response = serde_json::to_vec(&serde_json::json!({
+                    "ok": true,
+                    "state": "running",
+                    "message": format!("handled {expected}"),
+                    "launch": if expected == "launch" { Some("object=1 task=1") } else { None::<&str> },
+                }))
+                .unwrap();
+                response.push(b'\n');
+                stream.write_all(&response).unwrap();
+            }
+        })
+    }
+
+    #[test]
+    fn launch_autostarts_stopped_runtime_and_preserves_session_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("control.sock");
+        let spec = directory.path().join("cell.json");
+        let runtime = directory.path().join("runtime");
+        fs::create_dir_all(runtime.join("droidloom")).unwrap();
+        fs::write(runtime.join("droidloom/session.env"), "DROIDLOOM_MODE=mobile\n").unwrap();
+
+        let call_log = directory.path().join("systemctl.log");
+        let systemctl = directory.path().join("systemctl");
+        let ready_flag = directory.path().join("systemctl-started");
+        fs::write(
+            &systemctl,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"--user\" ] && [ \"$2\" = \"start\" ]; then\n  touch \"{}\"\n  while [ ! -S \"{}\" ]; do sleep 0.01; done\nfi\n",
+                call_log.display(),
+                ready_flag.display(),
+                socket.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let worker_socket = socket.clone();
+        let worker = thread::spawn(move || {
+            while !ready_flag.exists() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            spawn_mock_daemon(worker_socket, vec!["wait_ready", "launch"])
+                .join()
+                .unwrap();
+        });
+
+        let env_config = SessionEnvironment {
+            package_managed: false,
+            systemctl,
+            runtime_dir: Some(runtime.as_os_str().to_owned()),
+            desktop_vars: vec![("WAYLAND_DISPLAY", OsString::from("wayland-test"))],
+        };
+        let request = ControlRequest::Launch {
+            spec: spec.clone(),
+            package: "com.android.settings".into(),
+            component: Some("com.android.settings/.Settings".into()),
+            resolution: None,
+            user: 0,
+        };
+        let mut progress = Vec::new();
+        let response = execute_control_request(
+            &socket,
+            &socket,
+            &spec,
+            false,
+            &env_config,
+            &request,
+            &mut |message| progress.push(message.to_owned()),
+        )
+        .unwrap();
+        worker.join().unwrap();
+        assert!(response.ok);
+        assert_eq!(response.launch.as_deref(), Some("object=1 task=1"));
+        assert_eq!(
+            fs::read_to_string(runtime.join("droidloom/session.env")).unwrap(),
+            "DROIDLOOM_MODE=mobile\n"
+        );
+        let calls = fs::read_to_string(&call_log).unwrap();
+        assert!(calls.contains("--user import-environment WAYLAND_DISPLAY"));
+        assert!(calls.contains("--user start droidloom.service"));
+    }
+
+    #[test]
+    fn launch_retries_stale_socket_and_skips_systemctl_when_running() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("control.sock");
+        let spec = directory.path().join("cell.json");
+        let runtime = directory.path().join("runtime");
+        fs::create_dir_all(&runtime).unwrap();
+
+        // Live daemon does not invoke systemctl.
+        let systemctl = directory.path().join("systemctl");
+        let call_log = directory.path().join("systemctl.log");
+        fs::write(
+            &systemctl,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 1\n",
+                call_log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+        let env_config = SessionEnvironment {
+            package_managed: false,
+            systemctl: systemctl.clone(),
+            runtime_dir: Some(runtime.as_os_str().to_owned()),
+            desktop_vars: Vec::new(),
+        };
+
+        let worker = spawn_mock_daemon(socket.clone(), vec!["launch"]);
+        let request = ControlRequest::Launch {
+            spec: spec.clone(),
+            package: "com.android.settings".into(),
+            component: None,
+            resolution: None,
+            user: 0,
+        };
+        let response = execute_control_request(
+            &socket,
+            &socket,
+            &spec,
+            true,
+            &env_config,
+            &request,
+            &mut |_| {},
+        )
+        .unwrap();
+        worker.join().unwrap();
+        assert!(response.ok);
+        assert!(!call_log.exists());
+
+        // Stale socket (ConnectionRefused) triggers start and retry.
+        fs::remove_file(&socket).unwrap();
+        let stale = UnixListener::bind(&socket).unwrap();
+        drop(stale);
+        let ready_flag = directory.path().join("daemon-ready");
+        fs::write(
+            &systemctl,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"--user\" ] && [ \"$2\" = \"start\" ]; then\n  rm -f \"{}\"\n  touch \"{}\"\n  while [ ! -S \"{}\" ]; do sleep 0.01; done\nfi\n",
+                call_log.display(),
+                socket.display(),
+                ready_flag.display(),
+                socket.display()
+            ),
+        )
+        .unwrap();
+        let replacement = socket.clone();
+        let worker = thread::spawn(move || {
+            while !ready_flag.exists() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            spawn_mock_daemon(replacement, vec!["wait_ready", "launch"])
+                .join()
+                .unwrap();
+        });
+        let response = execute_control_request(
+            &socket,
+            &socket,
+            &spec,
+            true,
+            &env_config,
+            &request,
+            &mut |_| {},
+        )
+        .unwrap();
+        worker.join().unwrap();
+        assert!(response.ok);
+        assert!(
+            fs::read_to_string(&call_log)
+                .unwrap()
+                .contains("--user start droidloom.service")
+        );
+    }
+
+    #[test]
+    fn launch_does_not_autostart_for_non_default_socket_or_spec() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("custom.sock");
+        let default_socket = directory.path().join("default.sock");
+        let spec = directory.path().join("cell.json");
+        let env_config = SessionEnvironment {
+            package_managed: false,
+            systemctl: directory.path().join("missing-systemctl"),
+            runtime_dir: None,
+            desktop_vars: Vec::new(),
+        };
+        let request = ControlRequest::Launch {
+            spec: spec.clone(),
+            package: "com.android.settings".into(),
+            component: None,
+            resolution: None,
+            user: 0,
+        };
+        let error = execute_control_request(
+            &socket,
+            &default_socket,
+            &spec,
+            false,
+            &env_config,
+            &request,
+            &mut |_| {},
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("connect to droidloomd"), "{error}");
+    }
 }

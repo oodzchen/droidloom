@@ -80,3 +80,9 @@ cp packaging/fedora/density-desktop.json ~/.config/droidloom/density-v1.json
 droidloomctl window-mode windowed --width 960 --height 680
 droidloomctl start
 ```
+
+To start Droidloom automatically with your Plasma Wayland session after reboot, also run:
+
+```sh
+systemctl --user enable droidloom.service
+```

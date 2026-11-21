@@ -522,8 +522,9 @@ The subsequent source fixes and full-suite results are recorded above.
 
 ## Desktop and runtime
 
-- **Startup is manual.** Run `droidloomctl start` before launching an app. App
-  launch does not start a stopped runtime. First boot may take longer than later
+- **Startup is manual unless enabled.** Run `droidloomctl start` (or enable
+  `droidloom.service`) to boot Android ahead of time; `droidloomctl launch` also
+  starts a stopped runtime automatically. First boot may take longer than later
   starts while Android initializes its data.
 - **Direct layer composition needs host support.** The global layer-export path
   requires Denial's surface alpha and buffer-orientation handling. Unsupported

@@ -3,9 +3,10 @@
 ## Windows
 
 `droidloomctl start` and `droidloomctl stop` control the complete runtime. Startup
-is manual. The catalog exports Android launcher activities, labels and icons as
-XDG desktop applications. `droidloomctl applications` lists the catalog; launches
-require a running cell.
+is manual unless `droidloom.service` is enabled, and `droidloomctl launch` starts
+a stopped runtime automatically. The catalog exports Android launcher activities,
+labels and icons as XDG desktop applications. `droidloomctl applications` lists
+the catalog.
 
 The catalog subscribes to framework package/user/locale events. It snapshots on
 connection and changes, fetches missing icons in batches, and blocks while idle.

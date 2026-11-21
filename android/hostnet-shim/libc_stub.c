@@ -1,0 +1,1 @@
+int *__errno(void) { return 0; }

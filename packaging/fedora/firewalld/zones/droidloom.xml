@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<zone target="DROP">
+<zone target="ACCEPT">
   <short>Droidloom</short>
-  <description>Private veth zone for Droidloom Android cell.</description>
+  <description>Private veth zone for Droidloom Android cell; per-cell droidloom nftables rules enforce input/forward isolation.</description>
   <interface name="dlh+"/>
   <source address="10.177.0.0/30"/>
 </zone>

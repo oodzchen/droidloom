@@ -66,6 +66,7 @@ fi
 /usr/lib/droidloom/fedora-classpath-compat
 /usr/lib/droidloom/fedora-init.rc
 /usr/lib/droidloom/fedora-vendor-build.prop
+/usr/lib/droidloom/libdroidloom_hostnet_shim.so
 /usr/lib/firewalld/policies/droidloom-egress.xml
 /usr/lib/firewalld/zones/droidloom.xml
 /usr/lib/systemd/system/droidloomd.service

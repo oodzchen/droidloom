@@ -52,6 +52,11 @@ const ANDROID_SELINUX_COMPAT_PRELOAD: &str =
     "/system/lib64/bootstrap/libclang_rt.hwasan-aarch64-android.so";
 #[cfg(target_arch = "x86_64")]
 const ANDROID_SELINUX_COMPAT_PRELOAD: &str = "/system/lib64/libclang_rt.asan-x86_64-android.so";
+const HOSTNET_SHIM_HOST_PATH: &str = "/usr/lib/droidloom/libdroidloom_hostnet_shim.so";
+#[cfg(target_arch = "aarch64")]
+const HOSTNET_SHIM_PRELOAD: &str = "/system/lib64/libclang_rt.asan-aarch64-android.so";
+#[cfg(target_arch = "x86_64")]
+const HOSTNET_SHIM_PRELOAD: &str = "/system/lib64/libclang_rt.ubsan_standalone-x86_64-android.so";
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 compile_error!("Droidloom supports only aarch64 and x86_64 hosts");
 const DRM_DEVICE_MAJOR: u64 = 226;
@@ -105,6 +110,8 @@ const POWER_SUPPLY_ATTRIBUTES: [&str; 27] = [
     "charging_state",
     "charging_policy",
 ];
+
+pub(crate) const OWNER_PID_FILE: &str = "owner.pid";
 
 /// Failure to validate or start the deliberately minimal first-boot cell.
 #[derive(Debug, Error)]
@@ -477,10 +484,14 @@ pub fn start_development_cell(
         }
     };
     let parent_pid = unsafe { libc::getpid() };
-    let mut command = droidloom_cpu_placement::command("ip");
-    command
-        .args(["netns", "exec", network.namespace(), "unshare"])
-        .args([
+    let mut command = if let Some(namespace) = network.namespace() {
+        let mut cmd = droidloom_cpu_placement::command("ip");
+        cmd.args(["netns", "exec", namespace, "unshare"]);
+        cmd
+    } else {
+        droidloom_cpu_placement::command("unshare")
+    };
+    command.args([
             OsStr::new("--mount"),
             OsStr::new("--pid"),
             // Host-side setup helpers also need /proc to describe this PID
@@ -517,13 +528,30 @@ pub fn start_development_cell(
     }
     let child_result = command.spawn();
     match child_result {
-        Ok(child) => {
-            let adb = adb_client.and_then(|client| match AdbConnection::start(client) {
-                Ok(connection) => Some(connection),
-                Err(error) => {
-                    eprintln!("droidloom-supervisor: automatic ADB registration failed: {error}");
-                    None
-                }
+        Ok(mut child) => {
+            let owner_pid_path = spec.runtime_dir.join(OWNER_PID_FILE);
+            if let Err(error) = fs::write(&owner_pid_path, format!("{}\n", child.id()))
+                .map_err(|source| io_error("write Android namespace owner PID", source))
+                .and_then(|()| set_mode(&owner_pid_path, 0o600))
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = network.teardown();
+                let _ = cleanup_runtime_directory(spec);
+                return Err(error);
+            }
+            let adb = crate::adb::endpoint_for(spec).and_then(|adb_endpoint| {
+                adb_client.and_then(|client| {
+                    match AdbConnection::start_at_endpoint(client, adb_endpoint) {
+                        Ok(connection) => Some(connection),
+                        Err(error) => {
+                            eprintln!(
+                                "droidloom-supervisor: automatic ADB registration failed: {error}"
+                            );
+                            None
+                        }
+                    }
+                })
             });
             Ok(DevelopmentCell {
                 spec: spec.clone(),
@@ -722,6 +750,14 @@ fn cleanup_runtime_directory(spec: &CellSpec) -> Result<(), DevelopmentError> {
         (
             spec.runtime_dir.join("android-servicemanager.rc"),
             "remove servicemanager service",
+        ),
+        (
+            spec.runtime_dir.join("android-netd-host.rc"),
+            "remove host-network netd service",
+        ),
+        (
+            spec.runtime_dir.join(OWNER_PID_FILE),
+            "remove Android namespace owner PID",
         ),
     ] {
         match fs::remove_file(path) {
@@ -934,6 +970,13 @@ pub fn enter_development_cell(spec: &CellSpec) -> Result<(), DevelopmentError> {
     bind_adb_configuration(spec, &root)?;
     bind_product_properties(spec, &root)?;
     bind_root_servicemanager(spec, &root)?;
+    if spec
+        .network
+        .as_ref()
+        .is_some_and(|network| network.mode == crate::NetworkMode::Host)
+    {
+        bind_hostnet_netd_shim(spec, &root)?;
+    }
 
     // The reusable base is a system-as-root image, but Droidloom has already
     // supplied the mounts that Android first-stage init normally constructs.
@@ -1439,12 +1482,31 @@ fn mount_proc_and_sys(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
     bind_mount(&proc, &proc, false)?;
     remount(&proc, "bind,ro,nosuid,nodev,noexec")?;
 
-    // Linux isolates /proc/sys/net through the cell's network namespace, so
-    // expose just that subtree as writable. Global controls and sysrq-trigger
-    // remain behind the read-only parent proc mount.
-    let network_sysctls = proc.join("sys/net");
-    bind_mount(&network_sysctls, &network_sysctls, false)?;
-    remount(&network_sysctls, "bind,rw,nosuid,nodev,noexec")?;
+    // In private-netns modes Linux isolates /proc/sys/net cleanly, so expose
+    // the full subtree rw for IpClient/netd. In shared host network mode keep
+    // host /proc/sys/net read-only and expose only the cell's `wlan0` anchor.
+    let is_host_net = spec
+        .network
+        .as_ref()
+        .is_some_and(|n| n.mode == crate::NetworkMode::Host);
+    if is_host_net {
+        for subpath in [
+            "sys/net/ipv4/conf/wlan0",
+            "sys/net/ipv6/conf/wlan0",
+            "sys/net/ipv4/neigh/wlan0",
+            "sys/net/ipv6/neigh/wlan0",
+        ] {
+            let wlan_sysctl = proc.join(subpath);
+            if wlan_sysctl.is_dir() {
+                bind_mount(&wlan_sysctl, &wlan_sysctl, false)?;
+                remount(&wlan_sysctl, "bind,rw,nosuid,nodev,noexec")?;
+            }
+        }
+    } else {
+        let network_sysctls = proc.join("sys/net");
+        bind_mount(&network_sysctls, &network_sysctls, false)?;
+        remount(&network_sysctls, "bind,rw,nosuid,nodev,noexec")?;
+    }
     project_private_bpf_sysctls(spec, root)?;
 
     // Do not expose the host sysfs device tree. ueventd coldboot would
@@ -2251,7 +2313,7 @@ fn bind_adb_configuration(spec: &CellSpec, root: &Path) -> Result<(), Developmen
     let target = root.join("system/etc/init/hw/init.rc");
     let mut init = fs::read_to_string(&target)
         .map_err(|source| io_error("read Android init for ADB", source))?;
-    init.push_str(crate::adb::INIT_POLICY);
+    init.push_str(crate::adb::init_policy_for(spec));
     let source = directory.join("init.rc");
     fs::write(&source, init).map_err(|source| io_error("write Android ADB init policy", source))?;
     set_mode(&source, 0o644)?;
@@ -2271,7 +2333,7 @@ fn bind_product_properties(spec: &CellSpec, root: &Path) -> Result<(), Developme
     let original = fs::read_to_string(&target)
         .map_err(|source| io_error("read Android product properties", source))?;
     let properties = crate::tracing::container_properties(&original);
-    let properties = crate::identity::product_properties(&properties, &crate::identity::host());
+    let properties = crate::identity::product_properties(&properties, &crate::identity::resolve(spec));
     let properties = crate::app_properties::product_properties(&properties);
     let properties = spec.graphics_backend.product_properties(&properties);
     let source = spec.runtime_dir.join("android-product.prop");
@@ -2303,6 +2365,48 @@ fn root_servicemanager(original: &str) -> Option<String> {
     original
         .contains(SYSTEM)
         .then(|| original.replacen(SYSTEM, "\n    user root\n", 1))
+}
+
+fn bind_hostnet_netd_shim(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentError> {
+    let shim_host = Path::new(HOSTNET_SHIM_HOST_PATH);
+    let preload_target = root.join(HOSTNET_SHIM_PRELOAD.trim_start_matches('/'));
+    bind_mount_read_only_executable(shim_host, &preload_target)?;
+
+    let netd_rc_target = root.join("system/etc/init/netd.rc");
+    let original = fs::read_to_string(&netd_rc_target)
+        .map_err(|e| io_error("read netd service for host-network shim", e))?;
+    let updated = inject_netd_hostnet_preload(&original)?;
+    let source = spec.runtime_dir.join("android-netd-host.rc");
+    fs::write(&source, updated)
+        .map_err(|e| io_error("write host-network netd service", e))?;
+    set_mode(&source, 0o644)?;
+    bind_mount(&source, &netd_rc_target, true)
+}
+
+fn inject_netd_hostnet_preload(original: &str) -> Result<String, DevelopmentError> {
+    use std::fmt::Write as _;
+
+    let preload_line = format!(
+        "    setenv LD_PRELOAD {ANDROID_SELINUX_COMPAT_PRELOAD}:{HOSTNET_SHIM_PRELOAD}\n"
+    );
+    let mut out = String::with_capacity(original.len() + preload_line.len() * 2);
+    let mut injected = 0usize;
+    for line in original.split_inclusive('\n') {
+        out.push_str(line);
+        let trimmed = line.trim();
+        if trimmed == "service netd1shot /system/bin/netd oneshot"
+            || trimmed == "service netd /system/bin/netd"
+        {
+            let _ = out.write_str(&preload_line);
+            injected += 1;
+        }
+    }
+    if injected == 0 {
+        return Err(DevelopmentError::InvalidInput(
+            "system/etc/init/netd.rc has no netd service definition".into(),
+        ));
+    }
+    Ok(out)
 }
 
 fn bind_cpu_policy(spec: &CellSpec, root: &Path, policy: &str) -> Result<(), DevelopmentError> {
@@ -2903,5 +3007,21 @@ mod tests {
                 0o444
             );
         }
+    }
+
+    #[test]
+    fn hostnet_preload_injects_both_netd_services() {
+        let sample = "\
+service netd1shot /system/bin/netd oneshot
+    class main
+
+service netd /system/bin/netd
+    class main
+";
+        let rendered = inject_netd_hostnet_preload(sample).unwrap();
+        let expected_env = format!(
+            "    setenv LD_PRELOAD {ANDROID_SELINUX_COMPAT_PRELOAD}:{HOSTNET_SHIM_PRELOAD}"
+        );
+        assert_eq!(rendered.matches(&expected_env).count(), 2);
     }
 }

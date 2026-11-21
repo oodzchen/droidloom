@@ -1,0 +1,32 @@
+LIBC {
+  global:
+    socket;
+    close;
+    setsockopt;
+    write;
+    writev;
+    send;
+    sendto;
+    sendmsg;
+    read;
+    __read_chk;
+    recv;
+    recvfrom;
+    __recvfrom_chk;
+    recvmsg;
+    ioctl;
+    access;
+    poll;
+  local:
+    *;
+};
+
+LIBC_N {
+  global:
+    __write_chk;
+} LIBC;
+
+LIBC_O {
+  global:
+    __sendto_chk;
+} LIBC_N;

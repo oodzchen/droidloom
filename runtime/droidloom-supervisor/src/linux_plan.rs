@@ -924,6 +924,8 @@ mod tests {
             render_node: "/dev/dri/renderD128".into(),
             graphics_backend: crate::GraphicsBackend::default(),
             denial_socket: "/run/user/1000/denial/native-bridge.sock".into(),
+            network: None,
+            device_identity: None,
         }
     }
 

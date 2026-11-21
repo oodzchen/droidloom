@@ -1939,6 +1939,13 @@ fn own_threads() -> u32 {
 }
 
 fn android_init_pid(spec: &CellSpec) -> Result<Option<u32>, ControlError> {
+    if spec
+        .network
+        .as_ref()
+        .is_some_and(|network| network.mode == crate::NetworkMode::Host)
+    {
+        return host_network_init_pid(spec);
+    }
     for pid in android_namespace_pids(spec)? {
         let status = match fs::read_to_string(format!("/proc/{pid}/status")) {
             Ok(status) => status,
@@ -1951,6 +1958,97 @@ fn android_init_pid(spec: &CellSpec) -> Result<Option<u32>, ControlError> {
             .and_then(|ids| ids.split_whitespace().last())
             == Some("1");
         if is_init {
+            return Ok(Some(pid));
+        }
+    }
+    Ok(None)
+}
+
+fn host_network_init_pid(spec: &CellSpec) -> Result<Option<u32>, ControlError> {
+    let owner_path = spec.runtime_dir.join(crate::development::OWNER_PID_FILE);
+    let contents = match fs::read_to_string(&owner_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(io_error("read Android namespace owner PID", source)),
+    };
+    let Some(owner) = contents
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|&pid| pid > 0)
+    else {
+        return Ok(None);
+    };
+    find_init_pid_under_owner(Path::new("/proc"), owner)
+}
+
+fn find_init_pid_under_owner(proc_root: &Path, owner: u32) -> Result<Option<u32>, ControlError> {
+    let stat = match fs::read_to_string(proc_root.join(owner.to_string()).join("stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(io_error("read Android namespace owner state", source)),
+    };
+    let alive = stat
+        .rsplit_once(") ")
+        .is_some_and(|(_, rest)| !rest.starts_with(['Z', 'X']));
+    if !alive {
+        return Ok(None);
+    }
+
+    let mut saw_children_file = false;
+    let mut candidates = Vec::new();
+    let task_dir = proc_root.join(owner.to_string()).join("task");
+    if let Ok(tasks) = fs::read_dir(&task_dir) {
+        for task in tasks.flatten() {
+            if let Ok(children) = fs::read_to_string(task.path().join("children")) {
+                saw_children_file = true;
+                candidates.extend(
+                    children
+                        .split_whitespace()
+                        .filter_map(|token| token.parse::<u32>().ok())
+                        .filter(|&pid| pid > 0),
+                );
+            }
+        }
+    }
+    if !saw_children_file {
+        let entries = fs::read_dir(proc_root)
+            .map_err(|source| io_error("scan host proc entries", source))?;
+        for entry in entries.flatten() {
+            if let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+                .filter(|&pid| pid > 0)
+            {
+                candidates.push(pid);
+            }
+        }
+    }
+
+    let expected_ppid = owner.to_string();
+    for pid in candidates {
+        let status = match fs::read_to_string(proc_root.join(pid.to_string()).join("status")) {
+            Ok(status) => status,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(io_error("read cell process namespace IDs", source)),
+        };
+        let ppid_matches = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:"))
+            .map(str::trim)
+            == Some(expected_ppid.as_str());
+        if !ppid_matches {
+            continue;
+        }
+        let is_nested_init = status
+            .lines()
+            .find_map(|line| line.strip_prefix("NSpid:"))
+            .is_some_and(|ids| {
+                let tokens: Vec<_> = ids.split_whitespace().collect();
+                tokens.len() >= 2 && tokens.last() == Some(&"1")
+            });
+        if is_nested_init {
             return Ok(Some(pid));
         }
     }
@@ -2422,5 +2520,44 @@ mod tests {
         shutdown.request().unwrap();
         thread.join().unwrap().unwrap();
         assert!(!socket.exists());
+    }
+
+    #[test]
+    fn host_network_init_pid_resolves_nested_init_under_live_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let proc_root = directory.path();
+        let owner_dir = proc_root.join("100");
+        fs::create_dir_all(owner_dir.join("task/100")).unwrap();
+        fs::write(owner_dir.join("stat"), "100 (unshare) S 1 100 100 0 -1\n").unwrap();
+        fs::write(owner_dir.join("task/100/children"), "200 101 1\n").unwrap();
+
+        fs::create_dir_all(proc_root.join("200")).unwrap();
+        fs::write(
+            proc_root.join("200/status"),
+            "Name:\thelper\nPPid:\t100\nNSpid:\t200\t2\n",
+        )
+        .unwrap();
+
+        fs::create_dir_all(proc_root.join("1")).unwrap();
+        fs::write(
+            proc_root.join("1/status"),
+            "Name:\tsystemd\nPPid:\t0\nNSpid:\t1\n",
+        )
+        .unwrap();
+
+        fs::create_dir_all(proc_root.join("101")).unwrap();
+        fs::write(
+            proc_root.join("101/status"),
+            "Name:\tinit\nPPid:\t100\nNSpid:\t101\t1\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            find_init_pid_under_owner(proc_root, 100).unwrap(),
+            Some(101)
+        );
+
+        fs::write(owner_dir.join("stat"), "100 (unshare) Z 1 100 100 0 -1\n").unwrap();
+        assert_eq!(find_init_pid_under_owner(proc_root, 100).unwrap(), None);
     }
 }

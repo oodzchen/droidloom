@@ -1,0 +1,6 @@
+LIBC {
+  global:
+    __errno;
+  local:
+    *;
+};

@@ -222,9 +222,12 @@ fn configuration(
         for key in [
             "data_dir",
             "gapps_dir",
+            "share_user_folders",
             "shared_storage_directories",
             "subordinate_uids",
             "subordinate_gids",
+            "network",
+            "device_identity",
         ] {
             if let Some(value) = previous.get(key) {
                 recipe[key] = value.clone();
@@ -561,11 +564,17 @@ mod tests {
         assert_eq!(previous["data_dir"], "/var/lib/droidloom/users/1234/data");
         previous["data_dir"] = json!("/var/lib/droidloom/preserved-data");
         previous["gapps_dir"] = json!("/usr/lib/droidloom/addons/gapps");
+        previous["share_user_folders"] = json!(true);
+        previous["network"] = json!({"mode": "offline", "dns": ["9.9.9.9"]});
+        previous["device_identity"] = json!({"model": "Custom Phone"});
         previous["android_file_overrides"] = json!([]);
         let updated =
             configuration(recipe(), Some(&previous), 1234, &GpuChoice::Auto, &drm(128)).unwrap();
         assert_eq!(updated["data_dir"], previous["data_dir"]);
         assert_eq!(updated["gapps_dir"], previous["gapps_dir"]);
+        assert_eq!(updated["share_user_folders"], previous["share_user_folders"]);
+        assert_eq!(updated["network"], previous["network"]);
+        assert_eq!(updated["device_identity"], previous["device_identity"]);
         assert!(
             !updated["android_file_overrides"]
                 .as_array()

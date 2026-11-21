@@ -49,7 +49,13 @@ pub(crate) struct Lease {
     pub(crate) server: Ipv4Addr,
     pub(crate) client: Ipv4Addr,
     pub(crate) prefix_len: u8,
-    pub(crate) dns: [Ipv4Addr; 2],
+    pub(crate) dns: [Option<Ipv4Addr>; 4],
+}
+
+impl Lease {
+    pub(crate) fn dns_servers(&self) -> Vec<Ipv4Addr> {
+        self.dns.into_iter().flatten().collect()
+    }
 }
 
 /// Answers DHCP on one host interface until dropped.
@@ -311,9 +317,13 @@ fn reply(request: &[u8], lease: Lease) -> Option<Reply> {
         payload.extend_from_slice(&mask.to_be_bytes());
         payload.extend_from_slice(&[OPTION_ROUTER, 4]);
         payload.extend_from_slice(&lease.server.octets());
-        payload.extend_from_slice(&[OPTION_DNS, 8]);
-        for server in lease.dns {
-            payload.extend_from_slice(&server.octets());
+        let dns_servers = lease.dns_servers();
+        if !dns_servers.is_empty() {
+            let dns_len = u8::try_from(dns_servers.len() * 4).unwrap_or(16);
+            payload.extend_from_slice(&[OPTION_DNS, dns_len]);
+            for server in dns_servers {
+                payload.extend_from_slice(&server.octets());
+            }
         }
     }
     payload.push(OPTION_END);
@@ -431,7 +441,12 @@ mod tests {
         server: Ipv4Addr::new(10, 177, 0, 1),
         client: Ipv4Addr::new(10, 177, 0, 2),
         prefix_len: 30,
-        dns: [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)],
+        dns: [
+            Some(Ipv4Addr::new(1, 1, 1, 1)),
+            Some(Ipv4Addr::new(8, 8, 8, 8)),
+            None,
+            None,
+        ],
     };
     const MAC: [u8; 6] = [0x02, 0x64, 0x6c, 0, 0, 2];
 
@@ -567,5 +582,30 @@ mod tests {
         truncated.truncate(BOOTP_FIXED_LEN + 6);
         assert_eq!(reply(&truncated, LEASE), None);
         assert_eq!(reply(&request(7, &[]), LEASE), None);
+    }
+
+    #[test]
+    fn custom_dns_counts_encode_with_matching_option_length() {
+        let one_dns = Lease {
+            dns: [Some(Ipv4Addr::new(9, 9, 9, 9)), None, None, None],
+            ..LEASE
+        };
+        let offer_one = reply(&request(DISCOVER, &[]), one_dns).expect("offer");
+        assert_eq!(option(&offer_one, OPTION_DNS), Some(vec![9, 9, 9, 9]));
+
+        let three_dns = Lease {
+            dns: [
+                Some(Ipv4Addr::new(1, 1, 1, 1)),
+                Some(Ipv4Addr::new(8, 8, 8, 8)),
+                Some(Ipv4Addr::new(223, 5, 5, 5)),
+                None,
+            ],
+            ..LEASE
+        };
+        let offer_three = reply(&request(DISCOVER, &[]), three_dns).expect("offer");
+        assert_eq!(
+            option(&offer_three, OPTION_DNS),
+            Some(vec![1, 1, 1, 1, 8, 8, 8, 8, 223, 5, 5, 5])
+        );
     }
 }

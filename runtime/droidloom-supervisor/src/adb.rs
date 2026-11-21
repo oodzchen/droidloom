@@ -17,10 +17,28 @@ use std::time::{Duration, Instant};
 
 use crate::CellSpec;
 
-pub(crate) const ENDPOINT: &str = "10.177.0.2:5555";
 pub(crate) const DIRECTORY: &str = "adb";
 pub(crate) const KEYS_FILE: &str = "keys";
 const ADB: &str = "/usr/bin/adb";
+
+pub(crate) fn endpoint_for(spec: &CellSpec) -> Option<String> {
+    match spec.network.as_ref().map(|n| n.mode) {
+        Some(crate::NetworkMode::Host) => Some("127.0.0.1:5555".into()),
+        Some(crate::NetworkMode::Bridge) => spec
+            .network
+            .as_ref()
+            .and_then(|n| n.cell_ipv4)
+            .map(|ip| format!("{ip}:5555")),
+        _ => {
+            let ip = spec
+                .network
+                .as_ref()
+                .and_then(|network| network.cell_ipv4)
+                .unwrap_or(Ipv4Addr::new(10, 177, 0, 2));
+            Some(format!("{ip}:5555"))
+        }
+    }
+}
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_OUTPUT: u64 = 8192;
@@ -39,6 +57,31 @@ on property:sys.boot_completed=1
 on property:init.svc.adbd=stopped && property:sys.boot_completed=1
     start adbd
 ";
+
+const HOST_INIT_POLICY: &str = "
+# Droidloom's authenticated ADB transport bound to loopback only in host network mode.
+on post-fs-data
+    setprop service.adb.listen_addrs tcp:localhost:5555
+    start adbd
+
+on property:sys.boot_completed=1
+    start adbd
+
+on property:init.svc.adbd=stopped && property:sys.boot_completed=1
+    start adbd
+";
+
+pub(crate) fn init_policy_for(spec: &CellSpec) -> &'static str {
+    if spec
+        .network
+        .as_ref()
+        .is_some_and(|n| n.mode == crate::NetworkMode::Host)
+    {
+        HOST_INIT_POLICY
+    } else {
+        INIT_POLICY
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct AdbClient {
@@ -448,8 +491,8 @@ impl AdbConnection {
         Ok(Some(client))
     }
 
-    pub(crate) fn start(client: AdbClient) -> io::Result<Self> {
-        Self::start_at(client, ENDPOINT.to_owned(), RETRY_INTERVAL)
+    pub(crate) fn start_at_endpoint(client: AdbClient, endpoint: String) -> io::Result<Self> {
+        Self::start_at(client, endpoint, RETRY_INTERVAL)
     }
 
     fn start_at(client: AdbClient, endpoint: String, interval: Duration) -> io::Result<Self> {

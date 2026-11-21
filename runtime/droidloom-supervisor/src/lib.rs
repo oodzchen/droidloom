@@ -29,6 +29,7 @@ mod user_folders;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display};
+use std::net::Ipv4Addr;
 use std::path::{Component, Path, PathBuf};
 
 use droidloom_contracts::MIN_SUBORDINATE_IDS;
@@ -241,6 +242,126 @@ pub struct CellSpec {
     pub graphics_backend: GraphicsBackend,
     /// Authenticated Denial endpoint exposed at the fixed Android path.
     pub denial_socket: PathBuf,
+    /// Optional cell networking customization (subnet, DNS, offline mode, port access).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkConfig>,
+    /// Optional Android device identity property overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_identity: Option<DeviceIdentityOverride>,
+}
+
+/// Outbound network mode for the Android cell.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    /// Default NAT outbound forwarding over the host gateway.
+    #[default]
+    Nat,
+    /// Attach the host end of the cell veth pair to an existing host Linux bridge.
+    Bridge,
+    /// Share the host network namespace directly (experimental; skips private netns).
+    Host,
+    /// Offline sandbox: block outbound forwarding while keeping private cell networking.
+    Offline,
+}
+
+/// Transport protocol for firewall/forwarding rules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkProtocol {
+    /// Transmission Control Protocol.
+    Tcp,
+    /// User Datagram Protocol.
+    Udp,
+}
+
+impl NetworkProtocol {
+    /// Return the nftables keyword for this protocol.
+    pub const fn as_nft_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
+/// One host port reachable from the Android cell over the private veth gateway.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostAccessPort {
+    /// Transport protocol.
+    pub protocol: NetworkProtocol,
+    /// Destination port on the host gateway IP.
+    pub port: u16,
+}
+
+/// One host-to-cell DNAT port forwarding rule.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortForward {
+    /// Transport protocol.
+    pub protocol: NetworkProtocol,
+    /// Listening port on the host.
+    pub host_port: u16,
+    /// Destination port inside the Android cell.
+    pub cell_port: u16,
+    /// Host IPv4 bind address filter; defaults to loopback `127.0.0.1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_address: Option<Ipv4Addr>,
+}
+
+/// Custom cell networking settings.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkConfig {
+    /// Outbound forwarding mode.
+    #[serde(default)]
+    pub mode: NetworkMode,
+    /// Host-side veth gateway IPv4 address (defaults to `10.177.0.1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ipv4: Option<Ipv4Addr>,
+    /// Cell-side `wlan0` IPv4 address (defaults to `10.177.0.2`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_ipv4: Option<Ipv4Addr>,
+    /// IPv4 prefix length in `8..=30` (defaults to `30`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_len: Option<u8>,
+    /// Locally administered unicast MAC address for `wlan0` (defaults to `02:64:6c:00:00:02`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_mac: Option<String>,
+    /// Up to 4 IPv4 DNS resolvers handed out via DHCP (defaults to `[1.1.1.1, 8.8.8.8]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns: Vec<Ipv4Addr>,
+    /// Host ports explicitly reachable from Android (e.g. a local HTTP/SOCKS proxy).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_host_ports: Vec<HostAccessPort>,
+    /// Host-to-cell DNAT forwarding rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub port_forwards: Vec<PortForward>,
+    /// Existing host Linux bridge interface name when `mode == NetworkMode::Bridge`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_interface: Option<String>,
+}
+
+/// Explicit device identity and `build.prop` overrides applied on cell start.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceIdentityOverride {
+    /// Override `ro.product.model` and `ro.product.product.model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Override `ro.product.manufacturer` and `ro.product.product.manufacturer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manufacturer: Option<String>,
+    /// Override `ro.product.brand` and `ro.product.product.brand`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brand: Option<String>,
+    /// Override `ro.droidloom.device_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    /// Additional key/value entries projected into product properties.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_properties: BTreeMap<String, String>,
 }
 
 impl CellSpec {
@@ -374,10 +495,194 @@ impl CellSpec {
             problems.push("render_node must name exactly one /dev/dri/renderD<number> node".into());
         }
 
+        if let Some(network) = &self.network {
+            validate_network_config(network, &mut problems);
+        }
+        if let Some(identity) = &self.device_identity {
+            validate_device_identity(identity, &mut problems);
+        }
+
         if problems.is_empty() {
             Ok(())
         } else {
             Err(SpecError { problems })
+        }
+    }
+}
+
+fn validate_network_config(network: &NetworkConfig, problems: &mut Vec<String>) {
+    match network.mode {
+        NetworkMode::Nat | NetworkMode::Offline => {
+            if network.bridge_interface.is_some() {
+                problems.push("network.bridge_interface applies only to bridge mode".into());
+            }
+            let prefix = network.prefix_len.unwrap_or(30);
+            if !(8..=30).contains(&prefix) {
+                problems.push(format!("network.prefix_len {prefix} must be in 8..=30"));
+            }
+            let host_ip = network.host_ipv4.unwrap_or(Ipv4Addr::new(10, 177, 0, 1));
+            let cell_ip = network.cell_ipv4.unwrap_or(Ipv4Addr::new(10, 177, 0, 2));
+            for (name, ip) in [("network.host_ipv4", host_ip), ("network.cell_ipv4", cell_ip)] {
+                if ip.is_unspecified()
+                    || ip.is_loopback()
+                    || ip.is_multicast()
+                    || ip.is_broadcast()
+                {
+                    problems.push(format!(
+                        "{name} ({ip}) must be a unicast non-loopback IPv4 address"
+                    ));
+                }
+            }
+            if host_ip == cell_ip {
+                problems.push("network.host_ipv4 and network.cell_ipv4 must be distinct".into());
+            }
+            if (8..=30).contains(&prefix) {
+                let mask = u32::MAX << (32 - u32::from(prefix));
+                let host_bits = u32::from(host_ip);
+                let cell_bits = u32::from(cell_ip);
+                let net = host_bits & mask;
+                let bcast = net | !mask;
+                if (cell_bits & mask) != net {
+                    problems.push(format!(
+                        "network.host_ipv4 ({host_ip}) and network.cell_ipv4 ({cell_ip}) must share the same /{prefix} subnet"
+                    ));
+                }
+                for (name, bits) in [("network.host_ipv4", host_bits), ("network.cell_ipv4", cell_bits)] {
+                    if bits == net || bits == bcast {
+                        problems.push(format!(
+                            "{name} must not be the /{prefix} network or broadcast address"
+                        ));
+                    }
+                }
+            }
+        }
+        NetworkMode::Bridge => {
+            match network.bridge_interface.as_deref() {
+                Some(bridge) if is_valid_interface_name(bridge) => {}
+                _ => problems.push(
+                    "network.bridge_interface must be a valid host Linux bridge interface name in bridge mode".into(),
+                ),
+            }
+            if !network.allow_host_ports.is_empty() || !network.port_forwards.is_empty() {
+                problems.push(
+                    "network.allow_host_ports and network.port_forwards are unavailable in bridge mode".into(),
+                );
+            }
+        }
+        NetworkMode::Host => {
+            if network.bridge_interface.is_some()
+                || network.cell_mac.is_some()
+                || !network.allow_host_ports.is_empty()
+                || !network.port_forwards.is_empty()
+            {
+                problems.push(
+                    "host network mode does not accept bridge_interface, cell_mac, allow_host_ports, or port_forwards".into(),
+                );
+            }
+        }
+    }
+    if let Some(mac) = &network.cell_mac
+        && !is_valid_unicast_mac(mac)
+    {
+        problems.push("network.cell_mac must be a valid non-zero unicast MAC address".into());
+    }
+    if network.dns.len() > 4 {
+        problems.push("network.dns accepts at most 4 IPv4 servers".into());
+    }
+    for (index, dns) in network.dns.iter().enumerate() {
+        if dns.is_unspecified() || dns.is_broadcast() || dns.is_multicast() {
+            problems.push(format!(
+                "network.dns[{index}] ({dns}) is not a valid DNS address"
+            ));
+        }
+    }
+    if network.allow_host_ports.len() > 64 {
+        problems.push("network.allow_host_ports accepts at most 64 entries".into());
+    }
+    for (index, entry) in network.allow_host_ports.iter().enumerate() {
+        if entry.port == 0 {
+            problems.push(format!(
+                "network.allow_host_ports[{index}].port must be >= 1"
+            ));
+        }
+    }
+    if network.port_forwards.len() > 64 {
+        problems.push("network.port_forwards accepts at most 64 entries".into());
+    }
+    for (index, forward) in network.port_forwards.iter().enumerate() {
+        if forward.host_port == 0 || forward.cell_port == 0 {
+            problems.push(format!("network.port_forwards[{index}] ports must be >= 1"));
+        }
+        if let Some(bind) = forward.bind_address
+            && (bind.is_broadcast() || bind.is_multicast())
+        {
+            problems.push(format!(
+                "network.port_forwards[{index}].bind_address ({bind}) must not be broadcast or multicast"
+            ));
+        }
+    }
+}
+
+fn is_valid_interface_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() < 16
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn is_valid_unicast_mac(mac: &str) -> bool {
+    let parts: Vec<_> = mac.split(':').collect();
+    if parts.len() != 6 || !parts.iter().all(|part| part.len() == 2) {
+        return false;
+    }
+    let Ok(bytes) = parts
+        .iter()
+        .map(|part| u8::from_str_radix(part, 16))
+        .collect::<Result<Vec<u8>, _>>()
+    else {
+        return false;
+    };
+    (bytes[0] & 1) == 0 && bytes.iter().any(|&b| b != 0)
+}
+
+fn validate_device_identity(identity: &DeviceIdentityOverride, problems: &mut Vec<String>) {
+    for (name, value) in [
+        ("device_identity.model", identity.model.as_deref()),
+        ("device_identity.manufacturer", identity.manufacturer.as_deref()),
+        ("device_identity.brand", identity.brand.as_deref()),
+        ("device_identity.device_name", identity.device_name.as_deref()),
+    ] {
+        if let Some(val) = value {
+            if val.trim().is_empty() || val.chars().any(char::is_control) || val.len() > 91 {
+                problems.push(format!(
+                    "{name} must be 1..=91 UTF-8 bytes without control characters"
+                ));
+            }
+        }
+    }
+    if identity.extra_properties.len() > 64 {
+        problems.push("device_identity.extra_properties accepts at most 64 entries".into());
+    }
+    for (key, value) in &identity.extra_properties {
+        let valid_key = !key.is_empty()
+            && key.len() <= 96
+            && !key.starts_with('.')
+            && !key.ends_with('.')
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        if !valid_key {
+            problems.push(format!(
+                "device_identity.extra_properties key {key:?} is invalid"
+            ));
+        }
+        if value.chars().any(char::is_control) || value.len() > 91 {
+            problems.push(format!(
+                "device_identity.extra_properties[{key:?}] value must be <= 91 bytes without control characters"
+            ));
         }
     }
 }
@@ -766,6 +1071,8 @@ mod tests {
             render_node: "/dev/dri/renderD128".into(),
             graphics_backend: GraphicsBackend::default(),
             denial_socket: "/run/user/1000/denial/native-bridge.sock".into(),
+            network: None,
+            device_identity: None,
         }
     }
 
@@ -963,5 +1270,98 @@ mod tests {
         ];
         let error = invalid.validate().unwrap_err();
         assert_eq!(error.problems().len(), 3);
+    }
+
+    #[test]
+    fn spec_validates_network_and_device_identity_extensions() {
+        let mut valid = spec();
+        valid.network = Some(NetworkConfig {
+            mode: NetworkMode::Offline,
+            host_ipv4: Some(Ipv4Addr::new(10, 178, 0, 1)),
+            cell_ipv4: Some(Ipv4Addr::new(10, 178, 0, 2)),
+            prefix_len: Some(29),
+            cell_mac: Some("02:64:6c:00:00:10".into()),
+            dns: vec![Ipv4Addr::new(9, 9, 9, 9)],
+            allow_host_ports: vec![HostAccessPort {
+                protocol: NetworkProtocol::Tcp,
+                port: 7890,
+            }],
+            port_forwards: vec![PortForward {
+                protocol: NetworkProtocol::Tcp,
+                host_port: 15555,
+                cell_port: 5555,
+                bind_address: None,
+            }],
+            bridge_interface: None,
+        });
+        valid.device_identity = Some(DeviceIdentityOverride {
+            model: Some("Pixel 9 Pro".into()),
+            manufacturer: Some("Google".into()),
+            brand: Some("google".into()),
+            device_name: Some("DroidloomPad".into()),
+            extra_properties: BTreeMap::from([("ro.soc.model".into(), "SM8750".into())]),
+        });
+        valid.validate().unwrap();
+
+        let mut bridge_valid = spec();
+        bridge_valid.network = Some(NetworkConfig {
+            mode: NetworkMode::Bridge,
+            bridge_interface: Some("br0".into()),
+            cell_mac: Some("02:64:6c:00:00:22".into()),
+            ..NetworkConfig::default()
+        });
+        bridge_valid.validate().unwrap();
+
+        let mut host_valid = spec();
+        host_valid.network = Some(NetworkConfig {
+            mode: NetworkMode::Host,
+            ..NetworkConfig::default()
+        });
+        host_valid.validate().unwrap();
+
+        let mut bridge_missing = spec();
+        bridge_missing.network = Some(NetworkConfig {
+            mode: NetworkMode::Bridge,
+            ..NetworkConfig::default()
+        });
+        assert!(bridge_missing.validate().is_err());
+
+        let mut host_bad = spec();
+        host_bad.network = Some(NetworkConfig {
+            mode: NetworkMode::Host,
+            bridge_interface: Some("br0".into()),
+            ..NetworkConfig::default()
+        });
+        assert!(host_bad.validate().is_err());
+
+        let mut invalid = spec();
+        invalid.network = Some(NetworkConfig {
+            mode: NetworkMode::Nat,
+            host_ipv4: Some(Ipv4Addr::new(10, 177, 0, 0)),
+            cell_ipv4: Some(Ipv4Addr::new(10, 178, 0, 2)),
+            prefix_len: Some(31),
+            cell_mac: Some("01:00:00:00:00:00".into()),
+            dns: vec![Ipv4Addr::UNSPECIFIED],
+            allow_host_ports: vec![HostAccessPort {
+                protocol: NetworkProtocol::Tcp,
+                port: 0,
+            }],
+            port_forwards: vec![PortForward {
+                protocol: NetworkProtocol::Udp,
+                host_port: 0,
+                cell_port: 5000,
+                bind_address: Some(Ipv4Addr::BROADCAST),
+            }],
+            bridge_interface: None,
+        });
+        invalid.device_identity = Some(DeviceIdentityOverride {
+            model: Some(String::new()),
+            manufacturer: None,
+            brand: None,
+            device_name: Some("bad\nname".into()),
+            extra_properties: BTreeMap::from([(".bad..key".into(), "ok".into())]),
+        });
+        let err = invalid.validate().unwrap_err();
+        assert!(err.problems().len() >= 8, "{:?}", err.problems());
     }
 }

@@ -11,6 +11,7 @@ and Qualcomm Snapdragon 8 Elite (`SM8750` / Adreno 830 `/dev/dri/renderD128` via
 - [selinux/droidloom_fedora.te](selinux/droidloom_fedora.te): Type Enforcement policy allowing `binder` IPC, `mac_admin`/`mac_override`, container entrypoint labels, and tmpfs/pseudofs association under `unconfined_t` / `unconfined_service_t`.
 - [firewalld/zones/droidloom.xml](firewalld/zones/droidloom.xml) & [firewalld/policies/droidloom-egress.xml](firewalld/policies/droidloom-egress.xml): Outbound NAT/forwarding zone and policy for Droidloom veth interfaces (`dlh+`, `10.177.0.0/30`).
 - [density-desktop.json](density-desktop.json): Sample `$XDG_CONFIG_HOME/droidloom/density-v1.json` setting `dpiPerScale: 160` so `1 Android dp` matches `1 Wayland logical pixel`.
+- [braun/](braun/): `libcamera`-backed `org.braun.Camera1` system service (`droidloom-braun`) bridging host cameras to `droidloom-devices` and Android's camera HAL.
 
 ## Host Adaptations Required on Fedora + Adreno 830
 

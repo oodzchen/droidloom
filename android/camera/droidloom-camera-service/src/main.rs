@@ -256,6 +256,24 @@ impl Buffer {
         dma_buf_sync(fd.as_fd(), DMA_BUF_SYNC_WRITE | DMA_BUF_SYNC_END);
         written
     }
+
+    /// Writes into a 1D BLOB buffer without requiring 2D minigbm layout validation
+    /// (JPEG BLOB widths exceed `BufferMetadata::validate`'s 16384-pixel bound).
+    fn write_raw(&self, write: impl FnOnce(&mut [u8]) -> bool) -> bool {
+        let Some(fd) = self.fds.first() else {
+            return false;
+        };
+        let Ok(length) = descriptor_size(fd.as_fd()) else {
+            return false;
+        };
+        let Ok(mut mapping) = Mapping::new(fd.as_fd(), length, true) else {
+            return false;
+        };
+        dma_buf_sync(fd.as_fd(), DMA_BUF_SYNC_WRITE);
+        let written = write(mapping.bytes_mut());
+        dma_buf_sync(fd.as_fd(), DMA_BUF_SYNC_WRITE | DMA_BUF_SYNC_END);
+        written
+    }
 }
 
 /// A buffer to fill for a request.
@@ -713,7 +731,7 @@ impl Worker {
                 .and_then(|jpeg| exif::with_orientation(&jpeg, photo.orientation))
                 .is_some_and(|jpeg| {
                     photo.output.buffer.as_ref().is_some_and(|buffer| {
-                        buffer.write(|memory, _| write_blob(memory, &jpeg, photo.buffer_size))
+                        buffer.write_raw(|memory| write_blob(memory, &jpeg, photo.buffer_size))
                     })
                 });
         if !written {

@@ -1,0 +1,13 @@
+[Unit]
+Description=Droidloom libcamera-backed Braun camera bridge
+After=dbus-broker.service systemd-udevd.service
+
+[Service]
+Type=dbus
+BusName=org.braun
+ExecStart=/usr/local/bin/droidloom-braun
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

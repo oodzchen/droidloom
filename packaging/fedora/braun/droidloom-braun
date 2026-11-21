@@ -1,0 +1,890 @@
+#!/usr/bin/env python3
+"""libcamera-backed org.braun.Camera1 daemon for Droidloom.
+
+Exposes host libcamera cameras over the system D-Bus interface `org.braun`
+(`/org/braun`, `org.braun.Camera1`) and serves the `SOCK_SEQPACKET` braun
+session protocol expected by Droidloom's Android camera HAL.
+"""
+
+from __future__ import annotations
+
+import array
+import fcntl
+import logging
+import mmap
+import os
+import select
+import signal
+import socket
+import struct
+import sys
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import libcamera
+import numpy as np
+from gi.repository import Gio, GLib
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="droidloom-braun: %(levelname)s: %(message)s",
+    stream=sys.stderr,
+)
+LOG = logging.getLogger("droidloom-braun")
+
+BUS_NAME = "org.braun"
+OBJECT_PATH = "/org/braun"
+INTERFACE_NAME = "org.braun.Camera1"
+
+INTROSPECTION_XML = f"""
+<node>
+  <interface name="{INTERFACE_NAME}">
+    <property name="Cameras" type="aa{{sv}}" access="read"/>
+    <method name="Connect">
+      <arg name="session" type="h" direction="out"/>
+    </method>
+  </interface>
+</node>
+"""
+
+# braun session request kinds
+REQ_OPEN = 1
+REQ_CLOSE = 2
+REQ_FOCUS = 3
+REQ_ZOOM = 4
+REQ_SHOOT = 5
+REQ_RELEASE = 6
+
+# braun session reply kinds
+REP_OPENED = 1
+REP_FRAME = 2
+REP_CAPTURED = 3
+REP_SAVED = 4
+REP_FAILED = 5
+
+PREVIEW_WIDTH = 1024
+PREVIEW_HEIGHT = 768
+PREVIEW_SLOTS = 4
+
+DMA_BUF_IOCTL_SYNC = 0x40086200
+DMA_BUF_SYNC_READ = 1
+DMA_BUF_SYNC_START = 0
+DMA_BUF_SYNC_END = 4
+
+
+def dma_buf_sync(fd: int, flags: int) -> None:
+    try:
+        fcntl.ioctl(fd, DMA_BUF_IOCTL_SYNC, struct.pack("<Q", flags))
+    except OSError:
+        pass
+
+
+@dataclass(frozen=True)
+class CameraInfo:
+    id: str
+    name: str
+    facing: str
+    width: int
+    height: int
+    lens: bool
+    zoom: float
+    libcam_id: str
+
+
+def send_packet(sock: socket.socket, payload: bytes, fd: Optional[int] = None) -> None:
+    ancdata = []
+    if fd is not None:
+        ancdata.append(
+            (socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd]))
+        )
+    sock.sendmsg([payload], ancdata)
+
+
+def recv_packet(sock: socket.socket) -> Tuple[bytes, List[int]]:
+    data, ancdata, _flags, _addr = sock.recvmsg(4096, socket.CMSG_SPACE(16))
+    fds: List[int] = []
+    for cmsg_level, cmsg_type, cmsg_data in ancdata:
+        if cmsg_level == socket.SOL_SOCKET and cmsg_type == socket.SCM_RIGHTS:
+            arr = array.array("i")
+            usable = len(cmsg_data) - (len(cmsg_data) % arr.itemsize)
+            arr.frombytes(cmsg_data[:usable])
+            fds.extend(arr.tolist())
+    return data, fds
+
+
+def center_crop_aspect(img: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
+    h, w = img.shape[:2]
+    if w * target_h > h * target_w:
+        new_w = max(1, (h * target_w) // target_h)
+        x0 = (w - new_w) // 2
+        return img[:, x0 : x0 + new_w]
+    new_h = max(1, (w * target_h) // target_w)
+    y0 = (h - new_h) // 2
+    return img[y0 : y0 + new_h, :]
+
+
+def apply_zoom(img: np.ndarray, zoom: float) -> np.ndarray:
+    if zoom <= 1.01:
+        return img
+    h, w = img.shape[:2]
+    crop_w = max(16, int(round(w / zoom)))
+    crop_h = max(16, int(round(h / zoom)))
+    x0 = (w - crop_w) // 2
+    y0 = (h - crop_h) // 2
+    cropped = img[y0 : y0 + crop_h, x0 : x0 + crop_w]
+    return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def apply_orientation(img: np.ndarray, orientation: libcamera.Orientation) -> np.ndarray:
+    if orientation == libcamera.Orientation.Rotate0:
+        return img
+    if orientation == libcamera.Orientation.Rotate180:
+        return cv2.rotate(img, cv2.ROTATE_180)
+    if orientation == libcamera.Orientation.Rotate90:
+        return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    if orientation == libcamera.Orientation.Rotate270:
+        return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return img
+
+
+class BraunDaemon:
+    def __init__(self) -> None:
+        self.cm = libcamera.CameraManager.singleton()
+        self.cameras: List[CameraInfo] = []
+        self.cam_by_id: Dict[str, Tuple[CameraInfo, libcamera.Camera]] = {}
+        self.active_lock = threading.Lock()
+        self.active_cancel: Optional[threading.Event] = None
+        self.active_thread: Optional[threading.Thread] = None
+        self._discover_cameras()
+
+    def _discover_cameras(self) -> None:
+        used_ids: Dict[str, int] = {}
+        for cam in self.cm.cameras:
+            props = cam.properties
+            model = props.get(libcamera.properties.Model) or "camera"
+            loc = props.get(libcamera.properties.Location)
+            if loc == 0:
+                facing = "front"
+            elif loc == 1:
+                facing = "back"
+            else:
+                facing = "external"
+
+            pixel_size = props.get(libcamera.properties.PixelArraySize)
+            if pixel_size is not None:
+                width, height = int(pixel_size.width), int(pixel_size.height)
+            else:
+                width, height = 1920, 1080
+
+            has_af = libcamera.controls.AfTrigger in cam.controls
+
+            count = used_ids.get(model, 0)
+            used_ids[model] = count + 1
+            cam_id = model if count == 0 else f"{model}-{count}"
+
+            info = CameraInfo(
+                id=cam_id,
+                name=model,
+                facing=facing,
+                width=width,
+                height=height,
+                lens=bool(has_af),
+                zoom=1.0,
+                libcam_id=cam.id,
+            )
+            self.cameras.append(info)
+            self.cam_by_id[cam_id] = (info, cam)
+            LOG.info(
+                "discovered camera id=%s facing=%s %dx%d lens=%s (%s)",
+                info.id,
+                info.facing,
+                info.width,
+                info.height,
+                info.lens,
+                info.libcam_id,
+            )
+
+    def cameras_variant(self) -> GLib.Variant:
+        entries = []
+        for info in self.cameras:
+            entries.append(
+                {
+                    "id": GLib.Variant("s", info.id),
+                    "name": GLib.Variant("s", info.name),
+                    "facing": GLib.Variant("s", info.facing),
+                    "width": GLib.Variant("u", info.width),
+                    "height": GLib.Variant("u", info.height),
+                    "lens": GLib.Variant("b", info.lens),
+                    "zoom": GLib.Variant("d", info.zoom),
+                }
+            )
+        return GLib.Variant("aa{sv}", entries)
+
+    def connect_session(self) -> int:
+        server_sock, client_sock = socket.socketpair(
+            socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC
+        )
+        client_fd = os.dup(client_sock.fileno())
+        client_sock.close()
+
+        thread = threading.Thread(
+            target=self._serve_session,
+            args=(server_sock,),
+            daemon=True,
+        )
+        thread.start()
+        return client_fd
+
+    def _claim_camera_slot(self, cancel: threading.Event) -> None:
+        old_thread: Optional[threading.Thread] = None
+        with self.active_lock:
+            if self.active_cancel is not None and self.active_cancel is not cancel:
+                self.active_cancel.set()
+                old_thread = self.active_thread
+            self.active_cancel = cancel
+            self.active_thread = threading.current_thread()
+        if old_thread is not None and old_thread is not threading.current_thread():
+            old_thread.join(timeout=3.0)
+
+    def _release_camera_slot(self, cancel: threading.Event) -> None:
+        with self.active_lock:
+            if self.active_cancel is cancel:
+                self.active_cancel = None
+                self.active_thread = None
+
+    def _serve_session(self, sock: socket.socket) -> None:
+        cancel = threading.Event()
+        runner: Optional[CameraStream] = None
+        try:
+            sock.setblocking(False)
+            poller = select.poll()
+            poller.register(sock.fileno(), select.POLLIN)
+
+            while not cancel.is_set():
+                timeout_ms = 50 if runner is not None else 200
+                events = poller.poll(timeout_ms)
+                for fd, mask in events:
+                    if fd == sock.fileno():
+                        if mask & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
+                            return
+                        if mask & select.POLLIN:
+                            data, fds = recv_packet(sock)
+                            if not data:
+                                for extra in fds:
+                                    os.close(extra)
+                                return
+                            kind = data[0]
+                            body = data[1:]
+
+                            if kind == REQ_OPEN:
+                                for extra in fds:
+                                    os.close(extra)
+                                cam_id = body.decode("utf-8", errors="replace")
+                                if runner is not None:
+                                    poller.unregister(self.cm.event_fd)
+                                    runner.close()
+                                    runner = None
+                                self._claim_camera_slot(cancel)
+                                if cancel.is_set():
+                                    return
+                                entry = self.cam_by_id.get(cam_id)
+                                if entry is None:
+                                    send_packet(
+                                        sock,
+                                        struct.pack("<BI", REP_FAILED, 0)
+                                        + f"unknown camera {cam_id}".encode(),
+                                    )
+                                    continue
+                                info, cam = entry
+                                try:
+                                    runner = CameraStream(self.cm, info, cam, sock)
+                                    runner.open()
+                                    poller.register(self.cm.event_fd, select.POLLIN)
+                                except Exception as exc:
+                                    LOG.error("failed to open camera %s: %s", cam_id, exc)
+                                    if runner is not None:
+                                        runner.close()
+                                        runner = None
+                                    send_packet(
+                                        sock,
+                                        struct.pack("<BI", REP_FAILED, 0)
+                                        + str(exc).encode(),
+                                    )
+
+                            elif kind == REQ_CLOSE:
+                                for extra in fds:
+                                    os.close(extra)
+                                if runner is not None:
+                                    poller.unregister(self.cm.event_fd)
+                                    runner.close()
+                                    runner = None
+                                self._release_camera_slot(cancel)
+
+                            elif kind == REQ_FOCUS and len(body) >= 8:
+                                for extra in fds:
+                                    os.close(extra)
+                                if runner is not None:
+                                    x, y = struct.unpack_from("<ff", body, 0)
+                                    runner.request_focus(x, y)
+
+                            elif kind == REQ_ZOOM and len(body) >= 4:
+                                for extra in fds:
+                                    os.close(extra)
+                                if runner is not None:
+                                    (zoom,) = struct.unpack_from("<f", body, 0)
+                                    runner.set_zoom(zoom)
+
+                            elif kind == REQ_SHOOT and len(body) >= 4:
+                                (shot,) = struct.unpack_from("<I", body, 0)
+                                target_size = None
+                                if len(body) >= 12:
+                                    w, h = struct.unpack_from("<II", body, 4)
+                                    if w > 0 and h > 0:
+                                        target_size = (w, h)
+                                out_fd = fds[0] if fds else None
+                                for extra in fds[1:]:
+                                    os.close(extra)
+                                if runner is not None and out_fd is not None:
+                                    runner.shoot(shot, target_size, out_fd)
+                                else:
+                                    if out_fd is not None:
+                                        os.close(out_fd)
+                                    send_packet(
+                                        sock,
+                                        struct.pack("<BI", REP_FAILED, shot)
+                                        + b"camera not open",
+                                    )
+
+                            elif kind == REQ_RELEASE and len(body) >= 4:
+                                for extra in fds:
+                                    os.close(extra)
+                                if runner is not None:
+                                    (slot,) = struct.unpack_from("<I", body, 0)
+                                    runner.release_slot(slot)
+                            else:
+                                for extra in fds:
+                                    os.close(extra)
+
+                    elif runner is not None and fd == self.cm.event_fd:
+                        if mask & select.POLLIN:
+                            runner.handle_camera_events()
+
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            LOG.error("session error: %s", exc)
+        finally:
+            if runner is not None:
+                try:
+                    runner.close()
+                except Exception:
+                    pass
+            self._release_camera_slot(cancel)
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+class CameraStream:
+    def __init__(
+        self,
+        cm: libcamera.CameraManager,
+        info: CameraInfo,
+        cam: libcamera.Camera,
+        sock: socket.socket,
+    ) -> None:
+        self.cm = cm
+        self.info = info
+        self.cam = cam
+        self.sock = sock
+        self.acquired = False
+        self.started = False
+        self.stream: Optional[libcamera.Stream] = None
+        self.allocator: Optional[libcamera.FrameBufferAllocator] = None
+        self.requests: List[libcamera.Request] = []
+        self.buf_maps: Dict[int, Tuple[mmap.mmap, int]] = {}
+        self.preview_fd: Optional[int] = None
+        self.preview_map: Optional[mmap.mmap] = None
+        self.width = PREVIEW_WIDTH
+        self.height = PREVIEW_HEIGHT
+        self.stride = PREVIEW_WIDTH * 4
+        self.slot_bytes = PREVIEW_WIDTH * PREVIEW_HEIGHT * 4
+        self.orientation = libcamera.Orientation.Rotate0
+        self.free_slots: deque[int] = deque(range(PREVIEW_SLOTS))
+        self.sequence = 0
+        self.zoom = 1.0
+        self.pending_focus = False
+        self.latest_raw_bgra: Optional[np.ndarray] = None
+        self.pending_shots: deque[Tuple[int, Optional[Tuple[int, int]], int]] = deque()
+
+    def _stop_stream(self) -> None:
+        if self.started:
+            self.started = False
+            try:
+                self.cam.stop()
+            except Exception:
+                pass
+        try:
+            self.cm.get_ready_requests()
+        except Exception:
+            pass
+        self.requests.clear()
+        for mm, _fd in self.buf_maps.values():
+            try:
+                mm.close()
+            except Exception:
+                pass
+        self.buf_maps.clear()
+        self.allocator = None
+        self.stream = None
+
+    def _start_stream(
+        self,
+        role: libcamera.StreamRole,
+        size: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[int, int, int, libcamera.Orientation]:
+        cfg = self.cam.generate_configuration([role])
+        sc = cfg.at(0)
+        sc.pixel_format = libcamera.PixelFormat("XRGB8888")
+        if size is not None:
+            sc.size = libcamera.Size(size[0], size[1])
+        cfg.orientation = libcamera.Orientation.Rotate0
+        status = cfg.validate()
+        if status == libcamera.CameraConfiguration.Status.Invalid:
+            raise RuntimeError("invalid libcamera stream configuration")
+
+        ret = self.cam.configure(cfg)
+        if ret not in (None, 0):
+            raise RuntimeError(f"camera configure failed ({ret})")
+
+        width = int(sc.size.width)
+        height = int(sc.size.height)
+        stride = int(sc.stride)
+        orientation = cfg.orientation
+        self.stream = sc.stream
+
+        self.allocator = libcamera.FrameBufferAllocator(self.cam)
+        count = self.allocator.allocate(self.stream)
+        if count <= 0:
+            raise RuntimeError("libcamera buffer allocation failed")
+
+        for buf in self.allocator.buffers(self.stream):
+            plane = buf.planes[0]
+            mm = mmap.mmap(
+                plane.fd,
+                plane.length,
+                mmap.MAP_SHARED,
+                mmap.PROT_READ,
+                offset=plane.offset,
+            )
+            self.buf_maps[plane.fd] = (mm, plane.fd)
+            req = self.cam.create_request()
+            req.add_buffer(self.stream, buf)
+            self.requests.append(req)
+
+        # Drain any stale events before starting
+        self.cm.get_ready_requests()
+
+        ret = self.cam.start()
+        if ret not in (None, 0):
+            raise RuntimeError(f"camera start failed ({ret})")
+        self.started = True
+
+        for req in self.requests:
+            self.cam.queue_request(req)
+
+        return width, height, stride, orientation
+
+    def open(self) -> None:
+        ret = self.cam.acquire()
+        if ret not in (None, 0):
+            raise RuntimeError(f"camera acquire failed ({ret})")
+        self.acquired = True
+
+        self.width, self.height, self.stride, self.orientation = self._start_stream(
+            libcamera.StreamRole.Viewfinder,
+            (PREVIEW_WIDTH, PREVIEW_HEIGHT),
+        )
+
+        # After 90/270 software rotation, width and height swap
+        out_w, out_h = self.width, self.height
+        if self.orientation in (
+            libcamera.Orientation.Rotate90,
+            libcamera.Orientation.Rotate270,
+        ):
+            out_w, out_h = out_h, out_w
+        self.out_width = out_w
+        self.out_height = out_h
+        self.slot_bytes = out_w * out_h * 4
+
+        total_bytes = PREVIEW_SLOTS * self.slot_bytes
+        self.preview_fd = os.memfd_create("braun-preview", os.MFD_CLOEXEC)
+        os.ftruncate(self.preview_fd, total_bytes)
+        self.preview_map = mmap.mmap(
+            self.preview_fd,
+            total_bytes,
+            mmap.MAP_SHARED,
+            mmap.PROT_READ | mmap.PROT_WRITE,
+        )
+
+        reply = struct.pack(
+            "<BIIBII",
+            REP_OPENED,
+            self.out_width,
+            self.out_height,
+            1 if self.info.lens else 0,
+            PREVIEW_SLOTS,
+            self.slot_bytes,
+        )
+        send_packet(self.sock, reply, fd=self.preview_fd)
+        LOG.info(
+            "opened camera %s (%dx%d, stride=%d, orient=%s)",
+            self.info.id,
+            self.out_width,
+            self.out_height,
+            self.stride,
+            self.orientation,
+        )
+
+    def _capture_full_res(self) -> np.ndarray:
+        """Temporarily switch to full-resolution StillCapture, grab a settled frame,
+        and restore the preview stream."""
+        self._stop_stream()
+        try:
+            w, h, stride, orient = self._start_stream(
+                libcamera.StreamRole.StillCapture,
+                None,
+            )
+            poller = select.poll()
+            poller.register(self.cm.event_fd, select.POLLIN)
+            # Let soft-ISP AE/AWB settle for a couple of frames before taking the shot.
+            target_frames = 4
+            got = 0
+            captured: Optional[np.ndarray] = None
+            deadline = time.monotonic() + 4.0
+            while got < target_frames and time.monotonic() < deadline:
+                remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+                if not poller.poll(remaining_ms):
+                    break
+                for req in self.cm.get_ready_requests():
+                    if self.stream not in req.buffers:
+                        continue
+                    try:
+                        if req.status != libcamera.Request.Status.Complete:
+                            continue
+                        got += 1
+                        if got >= target_frames:
+                            buf = req.buffers[self.stream]
+                            plane = buf.planes[0]
+                            mm, fd = self.buf_maps[plane.fd]
+                            dma_buf_sync(fd, DMA_BUF_SYNC_READ | DMA_BUF_SYNC_START)
+                            try:
+                                raw = np.frombuffer(
+                                    mm, dtype=np.uint8, count=h * stride
+                                ).reshape((h, stride))
+                                bgra = raw[:, : w * 4].reshape((h, w, 4))
+                                captured = apply_orientation(bgra, orient).copy()
+                            finally:
+                                dma_buf_sync(fd, DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END)
+                    finally:
+                        if got < target_frames and self.started:
+                            req.reuse()
+                            self.cam.queue_request(req)
+            if captured is None:
+                raise RuntimeError("timed out capturing full-resolution frame")
+            return captured
+        finally:
+            self._stop_stream()
+            self.width, self.height, self.stride, self.orientation = self._start_stream(
+                libcamera.StreamRole.Viewfinder,
+                (PREVIEW_WIDTH, PREVIEW_HEIGHT),
+            )
+
+    def set_zoom(self, zoom: float) -> None:
+        if np.isfinite(zoom):
+            self.zoom = max(1.0, min(4.0, float(zoom)))
+
+    def request_focus(self, _x: float, _y: float) -> None:
+        if self.info.lens:
+            self.pending_focus = True
+
+    def release_slot(self, slot: int) -> None:
+        if 0 <= slot < PREVIEW_SLOTS and slot not in self.free_slots:
+            self.free_slots.append(slot)
+
+    def shoot(
+        self,
+        shot: int,
+        target_size: Optional[Tuple[int, int]],
+        out_fd: int,
+    ) -> None:
+        if self.latest_raw_bgra is not None:
+            self._complete_shot(shot, target_size, out_fd, self.latest_raw_bgra)
+        else:
+            self.pending_shots.append((shot, target_size, out_fd))
+
+    def _complete_shot(
+        self,
+        shot: int,
+        target_size: Optional[Tuple[int, int]],
+        out_fd: int,
+        bgra: np.ndarray,
+    ) -> None:
+        try:
+            send_packet(self.sock, struct.pack("<BI", REP_CAPTURED, shot))
+            need_full_res = (
+                target_size is None
+                or target_size[0] > self.out_width
+                or target_size[1] > self.out_height
+            )
+            source = bgra
+            if need_full_res:
+                try:
+                    source = self._capture_full_res()
+                except Exception as exc:
+                    LOG.warning("full-res capture failed, falling back to preview: %s", exc)
+            img = apply_zoom(source, self.zoom)
+            if self.info.facing == "front":
+                img = cv2.flip(img, 1)
+            if target_size is not None:
+                tw, th = target_size
+                img = center_crop_aspect(img, tw, th)
+                if img.shape[1] != tw or img.shape[0] != th:
+                    img = cv2.resize(img, (tw, th), interpolation=cv2.INTER_AREA)
+            bgr = img[:, :, :3]
+            ok, encoded = cv2.imencode(
+                ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95]
+            )
+            if not ok:
+                raise RuntimeError("JPEG encoding failed")
+            jpeg_bytes = encoded.tobytes()
+            os.lseek(out_fd, 0, os.SEEK_SET)
+            os.ftruncate(out_fd, 0)
+            written = 0
+            while written < len(jpeg_bytes):
+                n = os.write(out_fd, jpeg_bytes[written:])
+                if n <= 0:
+                    raise RuntimeError("short write to photo memfd")
+                written += n
+            send_packet(self.sock, struct.pack("<BI", REP_SAVED, shot))
+            LOG.info(
+                "shoot %d saved (%s -> %dx%d, %d bytes)",
+                shot,
+                target_size,
+                img.shape[1],
+                img.shape[0],
+                len(jpeg_bytes),
+            )
+        except Exception as exc:
+            LOG.error("shoot %d failed: %s", shot, exc)
+            try:
+                send_packet(
+                    self.sock,
+                    struct.pack("<BI", REP_FAILED, shot) + str(exc).encode(),
+                )
+            except OSError:
+                pass
+        finally:
+            try:
+                os.close(out_fd)
+            except OSError:
+                pass
+
+    def handle_camera_events(self) -> None:
+        ready = self.cm.get_ready_requests()
+        for req in ready:
+            if self.stream not in req.buffers:
+                continue
+            try:
+                if req.status != libcamera.Request.Status.Complete:
+                    continue
+                buf = req.buffers[self.stream]
+                plane = buf.planes[0]
+                mm, fd = self.buf_maps[plane.fd]
+                dma_buf_sync(fd, DMA_BUF_SYNC_READ | DMA_BUF_SYNC_START)
+                try:
+                    raw = np.frombuffer(
+                        mm, dtype=np.uint8, count=self.height * self.stride
+                    ).reshape((self.height, self.stride))
+                    bgra = raw[:, : self.width * 4].reshape(
+                        (self.height, self.width, 4)
+                    )
+                    upright = apply_orientation(bgra, self.orientation)
+                    self.latest_raw_bgra = upright.copy()
+                finally:
+                    dma_buf_sync(fd, DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END)
+
+                while self.pending_shots:
+                    shot, target_size, out_fd = self.pending_shots.popleft()
+                    self._complete_shot(shot, target_size, out_fd, self.latest_raw_bgra)
+
+                if self.free_slots and self.preview_map is not None:
+                    slot = self.free_slots.popleft()
+                    frame = apply_zoom(self.latest_raw_bgra, self.zoom)
+                    # braun mirrors the front camera's preview; Android HAL un-mirrors it.
+                    if self.info.facing == "front":
+                        frame = cv2.flip(frame, 1)
+                    if not frame.flags["C_CONTIGUOUS"]:
+                        frame = np.ascontiguousarray(frame)
+                    start = slot * self.slot_bytes
+                    self.preview_map[start : start + self.slot_bytes] = frame.tobytes()
+                    self.sequence += 1
+                    msg = struct.pack(
+                        "<BIIIQ",
+                        REP_FRAME,
+                        slot,
+                        self.out_width,
+                        self.out_height,
+                        self.sequence,
+                    )
+                    try:
+                        send_packet(self.sock, msg)
+                    except BlockingIOError:
+                        self.free_slots.append(slot)
+            finally:
+                if self.started:
+                    req.reuse()
+                    if self.pending_focus:
+                        self.pending_focus = False
+                        try:
+                            req.set_control(
+                                libcamera.controls.AfMode,
+                                libcamera.controls.AfModeEnum.Auto,
+                            )
+                            req.set_control(
+                                libcamera.controls.AfTrigger,
+                                libcamera.controls.AfTriggerEnum.Start,
+                            )
+                        except Exception:
+                            pass
+                    self.cam.queue_request(req)
+
+    def close(self) -> None:
+        while self.pending_shots:
+            shot, _size, out_fd = self.pending_shots.popleft()
+            try:
+                os.close(out_fd)
+            except OSError:
+                pass
+            try:
+                send_packet(
+                    self.sock,
+                    struct.pack("<BI", REP_FAILED, shot) + b"camera closed",
+                )
+            except OSError:
+                pass
+
+        self._stop_stream()
+        if self.acquired:
+            self.acquired = False
+            try:
+                self.cam.release()
+            except Exception:
+                pass
+        if self.preview_map is not None:
+            try:
+                self.preview_map.close()
+            except Exception:
+                pass
+            self.preview_map = None
+        if self.preview_fd is not None:
+            try:
+                os.close(self.preview_fd)
+            except OSError:
+                pass
+            self.preview_fd = None
+        LOG.info("closed camera %s", self.info.id)
+
+
+def main() -> int:
+    daemon = BraunDaemon()
+    node_info = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION_XML)
+    iface_info = node_info.interfaces[0]
+    loop = GLib.MainLoop()
+
+    def on_method_call(
+        _conn: Gio.DBusConnection,
+        _sender: str,
+        _path: str,
+        _interface: str,
+        method: str,
+        _params: GLib.Variant,
+        invocation: Gio.DBusMethodInvocation,
+    ) -> None:
+        if method == "Connect":
+            try:
+                fd = daemon.connect_session()
+                fd_list = Gio.UnixFDList.new()
+                idx = fd_list.append(fd)
+                os.close(fd)
+                invocation.return_value_with_unix_fd_list(
+                    GLib.Variant("(h)", (idx,)), fd_list
+                )
+            except Exception as exc:
+                LOG.error("Connect failed: %s", exc)
+                invocation.return_dbus_error(
+                    f"{BUS_NAME}.Error.Failed", str(exc)
+                )
+        else:
+            invocation.return_dbus_error(
+                "org.freedesktop.DBus.Error.UnknownMethod",
+                f"Unknown method {method}",
+            )
+
+    def on_get_property(
+        _conn: Gio.DBusConnection,
+        _sender: str,
+        _path: str,
+        _interface: str,
+        prop: str,
+    ) -> GLib.Variant:
+        if prop == "Cameras":
+            return daemon.cameras_variant()
+        return GLib.Variant("s", "")
+
+    def on_bus_acquired(conn: Gio.DBusConnection, _name: str) -> None:
+        conn.register_object(
+            OBJECT_PATH,
+            iface_info,
+            on_method_call,
+            on_get_property,
+            None,
+        )
+        LOG.info("registered %s on %s", INTERFACE_NAME, OBJECT_PATH)
+
+    def on_name_acquired(_conn: Gio.DBusConnection, name: str) -> None:
+        LOG.info("acquired bus name %s", name)
+
+    def on_name_lost(_conn: Gio.DBusConnection, name: str) -> None:
+        LOG.error("lost bus name %s", name)
+        loop.quit()
+
+    owner_id = Gio.bus_own_name(
+        Gio.BusType.SYSTEM,
+        BUS_NAME,
+        Gio.BusNameOwnerFlags.NONE,
+        on_bus_acquired,
+        on_name_acquired,
+        on_name_lost,
+    )
+
+    def handle_signal(_signum: int, _frame: object) -> None:
+        loop.quit()
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    try:
+        loop.run()
+    finally:
+        Gio.bus_unown_name(owner_id)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

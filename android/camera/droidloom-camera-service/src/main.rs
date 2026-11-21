@@ -305,6 +305,7 @@ impl Output {
 #[derive(Clone, Copy)]
 struct Configured {
     blob: bool,
+    video: bool,
     /// The size a JPEG stream asks braun for; `None` for the full photo.
     photo_size: Option<(u32, u32)>,
     buffer_size: usize,
@@ -629,6 +630,7 @@ impl Worker {
                 }
                 continue;
             }
+            let flip = mirrored && !configured.is_some_and(|stream| stream.video);
             let filled = output.ready()
                 && output.buffer.as_ref().is_some_and(|buffer| {
                     let Some(bgra) = self.braun.as_ref().and_then(|braun| braun.preview(preview)) else {
@@ -649,9 +651,10 @@ impl Worker {
                             planes: &planes,
                             memory,
                         };
-                        // Android's buffers are what the sensor sees; braun
-                        // mirrors the front camera's preview.
-                        frame::fill(&source, &mut target, mirrored).is_ok()
+                        // Preview streams are un-mirrored because Android's front-camera
+                        // preview mirrors them on screen; video encoder streams keep braun's
+                        // front-camera mirror so recorded videos match preview and photos.
+                        frame::fill(&source, &mut target, flip).is_ok()
                     })
                 });
             if !filled {
@@ -777,13 +780,15 @@ fn check_stream(camera: &Camera, stream: &Stream) -> Option<Configured> {
         let full = size == (camera.width, camera.height);
         return (full || stream_sizes(camera).contains(&size)).then_some(Configured {
             blob: true,
+            video: false,
             photo_size: (!full).then_some(size),
             buffer_size: usize::try_from(stream.bufferSize).unwrap_or(0),
         });
     }
     let known = format == tags::format::IMPLEMENTATION_DEFINED || format == tags::format::YCBCR_420_888;
+    let video = stream.usage.0 & BufferUsage::VIDEO_ENCODER.0 != 0;
     (known && stream_sizes(camera).contains(&size))
-        .then_some(Configured { blob: false, photo_size: None, buffer_size: 0 })
+        .then_some(Configured { blob: false, video, photo_size: None, buffer_size: 0 })
 }
 
 fn check_configuration(camera: &Camera, configuration: &StreamConfiguration) -> Option<Vec<Configured>> {

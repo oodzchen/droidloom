@@ -29,8 +29,8 @@
     <devicePorts>
         <devicePort tagName="Droidloom Host Output" type="AUDIO_DEVICE_OUT_BUS"
             role="sink" address="droidloom-host-output"/>
-        <devicePort tagName="Droidloom Host Input" type="AUDIO_DEVICE_IN_BUS"
-            role="source" address="droidloom-host-input"/>
+        <devicePort tagName="Droidloom Host Input" type="AUDIO_DEVICE_IN_BUILTIN_MIC"
+            role="source"/>
     </devicePorts>
     <routes>
         <route type="mix" sink="Droidloom Host Output"

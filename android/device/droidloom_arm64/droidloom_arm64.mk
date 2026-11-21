@@ -77,6 +77,7 @@ PRODUCT_COPY_FILES += \
     vendor/droidloom/android/device/droidloom_arm64/android.hardware.droidloom_app_compatibility.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.droidloom_app_compatibility.xml \
     vendor/droidloom/android/device/droidloom_arm64/audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio_policy_configuration.xml \
     vendor/droidloom/android/device/droidloom_arm64/droidloom_primary_audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/droidloom_primary_audio_policy_configuration.xml \
+    vendor/droidloom/android/device/droidloom_arm64/media_profiles_V1_0.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_profiles_V1_0.xml \
     frameworks/av/services/audiopolicy/config/audio_policy_volumes.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio_policy_volumes.xml \
     frameworks/av/services/audiopolicy/config/default_volume_tables.xml:$(TARGET_COPY_OUT_VENDOR)/etc/default_volume_tables.xml \
     frameworks/av/services/audiopolicy/config/surround_sound_configuration_5_0.xml:$(TARGET_COPY_OUT_VENDOR)/etc/surround_sound_configuration_5_0.xml
@@ -109,12 +110,14 @@ PRODUCT_VENDOR_PROPERTIES += \
     ro.egl.blobcache.multifile_limit=1073741824 \
     ro.egl.blobcache.multifile_entry_limit=65536 \
     debug.hwui.use_hint_manager=true \
+    debug.stagefright.c2inputsurface=-1 \
     media.c2.hal.selection=aidl \
     debug.sf.use_phase_offsets_as_durations=1 \
     debug.sf.late.app.duration=9333333 \
     debug.sf.early.app.duration=15666666 \
     debug.sf.earlyGl.app.duration=15666666 \
     persist.audio.normal_playback_period_ms=5 \
+    ro.boot.audio.tinyalsa.simulate_input=true \
     ro.zygote=zygote64 \
     dalvik.vm.dex2oat64.enabled=true \
     ro.vendor.droidloom.surfaceflinger_direct=true \

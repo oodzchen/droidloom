@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Droidloom Settings
+Name[zh_CN]=Droidloom 设置中心
+GenericName=Android Runtime Configuration
+GenericName[zh_CN]=Android 运行时与容器设置
+Comment=Configure Droidloom networking, storage, hardware, display orientation, and APKs
+Comment[zh_CN]=配置 Droidloom 网络转换、存储映射、硬件性能、显示重力方向及管理 APK
+Exec=@SETTINGS_EXEC@
+Icon=org.droidloom.Settings
+Terminal=false
+Categories=System;Settings;Qt;
+Keywords=droidloom;android;settings;apk;network;storage;
+StartupNotify=true

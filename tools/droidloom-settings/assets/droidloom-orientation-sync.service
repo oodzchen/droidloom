@@ -1,0 +1,13 @@
+[Unit]
+Description=Droidloom host physical orientation to Android rotation sync
+PartOf=droidloom.service
+After=droidloom.service iio-sensor-proxy.service
+
+[Service]
+Type=simple
+ExecStart=@SETTINGS_EXEC@ --orientation-daemon
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=droidloom.service

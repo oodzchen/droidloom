@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Droidloom APK Installer
+Name[zh_CN]=Droidloom APK 安装程序
+GenericName=Android Package Installer
+GenericName[zh_CN]=Android 应用安装包安装器
+Comment=Install standalone Android APK packages into Droidloom
+Comment[zh_CN]=使用 Droidloom 安装独立 Android APK 安装包
+Exec=@INSTALLER_EXEC@ %F
+Icon=org.droidloom.Settings
+Terminal=false
+MimeType=application/vnd.android.package-archive;
+Categories=System;PackageManager;Qt;
+NoDisplay=false
+StartupNotify=true

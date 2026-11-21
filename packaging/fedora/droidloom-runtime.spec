@@ -4,14 +4,16 @@
 %global __os_install_post %{nil}
 %define _binary_payload w3.zstdio
 %{!?stage_dir:%global stage_dir %{_topdir}/../stage-runtime}
+%{!?pkg_version:%global pkg_version 0.1.0}
+%{!?pkg_release:%global pkg_release 42}
 
 Name:           droidloom-runtime
-Version:        0.1.0
-Release:        42%{?dist}
+Version:        %{pkg_version}
+Release:        %{pkg_release}%{?dist}
 Summary:        Android applications in native Wayland windows
 License:        GPL-3.0-or-later
 URL:            https://github.com/denialwm/droidloom
-ExclusiveArch:  aarch64
+ExclusiveArch:  x86_64 aarch64
 AutoReqProv:    no
 Requires:       droidloom-image = %{version}-%{release}
 Requires:       glibc, libgcc, mesa-libgbm, mesa-libEGL, mesa-vulkan-drivers
@@ -63,11 +65,12 @@ fi
 /usr/bin/droidloomd
 %dir /usr/lib/droidloom
 /usr/lib/droidloom/droidloom-package-helper
-/usr/lib/droidloom/fedora-classpath-compat
+%ifarch aarch64
 /usr/lib/droidloom/fedora-init.rc
 /usr/lib/droidloom/fedora-vendor-build.prop
 /usr/lib/droidloom/libdroidloom_hostnet_shim.so
 /usr/lib/droidloom/media
+%endif
 /usr/lib/firewalld/policies/droidloom-egress.xml
 /usr/lib/firewalld/zones/droidloom.xml
 /usr/lib/systemd/system/droidloomd.service

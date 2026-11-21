@@ -4,14 +4,16 @@
 %global __os_install_post %{nil}
 %define _binary_payload w1.zstdio
 %{!?stage_dir:%global stage_dir %{_topdir}/../stage-image}
+%{!?pkg_version:%global pkg_version 0.1.0}
+%{!?pkg_release:%global pkg_release 42}
 
 Name:           droidloom-image
-Version:        0.1.0
-Release:        42%{?dist}
+Version:        %{pkg_version}
+Release:        %{pkg_release}%{?dist}
 Summary:        Android system and Droidloom Android components
 License:        GPL-3.0-or-later AND LicenseRef-Android AND LicenseRef-Mesa
 URL:            https://github.com/denialwm/droidloom
-ExclusiveArch:  aarch64
+ExclusiveArch:  x86_64 aarch64
 AutoReqProv:    no
 
 %description

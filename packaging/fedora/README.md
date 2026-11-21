@@ -1,22 +1,22 @@
 # Fedora Linux Packaging & Hardware Adaptation
 
-Packaging definitions and host adaptations validated on **Fedora Linux 45 (`aarch64`)**
-with KDE Plasma Wayland (`kwin_wayland`), SELinux (`Enforcing`), `firewalld`,
-and Qualcomm Snapdragon 8 Elite (`SM8750` / Adreno 830 `/dev/dri/renderD128` via `msm_dpu`).
+Packaging definitions and host adaptations for **Fedora Linux 45** (`x86_64` and `aarch64`)
+with KDE Plasma Wayland (`kwin_wayland`), SELinux (`Enforcing`), and `firewalld`.
 
 ## Contents
 
-- [droidloom-image.spec](droidloom-image.spec): RPM spec packaging `/usr/lib/droidloom/{images,runtime,storage,current}`.
-- [droidloom-runtime.spec](droidloom-runtime.spec): RPM spec packaging host binaries, systemd units, SELinux module, `firewalld` rules, and Android cell overrides.
+- [Containerfile](Containerfile): Rootless Fedora 45 builder image for compiling host binaries, `droidloom-update`, SELinux policy modules, and RPMs.
+- [droidloom-image.spec](droidloom-image.spec): RPM spec packaging `/usr/lib/droidloom/{runtime,storage,images,current}`.
+- [droidloom-runtime.spec](droidloom-runtime.spec): RPM spec packaging host binaries, systemd units, SELinux module, `firewalld` rules, and architecture-specific Fedora overrides.
 - [selinux/droidloom_fedora.te](selinux/droidloom_fedora.te): Type Enforcement policy allowing `binder` IPC, `mac_admin`/`mac_override`, container entrypoint labels, and tmpfs/pseudofs association under `unconfined_t` / `unconfined_service_t`.
 - [firewalld/zones/droidloom.xml](firewalld/zones/droidloom.xml) & [firewalld/policies/droidloom-egress.xml](firewalld/policies/droidloom-egress.xml): Outbound NAT/forwarding zone and policy for Droidloom veth interfaces (`dlh+`, `10.177.0.0/30`).
 - [density-desktop.json](density-desktop.json): Sample `$XDG_CONFIG_HOME/droidloom/density-v1.json` setting `dpiPerScale: 160` so `1 Android dp` matches `1 Wayland logical pixel`.
 - [braun/](braun/): `libcamera`-backed `org.braun.Camera1` system service (`droidloom-braun`) bridging host cameras to `droidloom-devices` and Android's camera HAL.
 
-## Host Adaptations Required on Fedora + Adreno 830
+## Host Adaptations on Fedora
 
 ### 1. SELinux Policy Module
-Compile [selinux/droidloom_fedora.te](selinux/droidloom_fedora.te) into `/usr/share/selinux/packages/droidloom_fedora.pp` before packaging `droidloom-runtime`:
+`packaging/fedora/selinux/droidloom_fedora.te` is compiled into `/usr/share/selinux/packages/droidloom_fedora.pp` during RPM staging:
 
 ```sh
 checkmodule -M -m -o droidloom_fedora.mod packaging/fedora/selinux/droidloom_fedora.te
@@ -26,54 +26,37 @@ semodule_package -o droidloom_fedora.pp -m droidloom_fedora.mod
 The `%post` scriptlet in `droidloom-runtime.spec` installs the module with `semodule -i`.
 
 ### 2. Fedora `bpffs` SELinux Context Compatibility (`ClatCoordinator`)
-On Fedora with SELinux enforcing on the shared host kernel, `/sys/fs/bpf` nodes carry `u:object_r:bpf_t:s0` rather than Android's `u:object_r:fs_bpf:s0`. Android's `libservice-connectivity.so` (`verifyPerms` in `ClatCoordinator`) originally tolerated missing `security.selinux` xattrs (`EOPNOTSUPP`/`ENODATA`) under `DROIDLOOM_CELL`, but aborted `system_server` when an xattr existed with `bpf_t != fs_bpf`.
+On Fedora with SELinux enforcing on the shared host kernel, `/sys/fs/bpf` nodes carry `u:object_r:bpf_t:s0` rather than Android's `u:object_r:fs_bpf:s0`. Patch `android/aosp-patches/0001-netbpfload-tolerate-shared-kernel-bpf-ids.patch` now relaxes the `ClatCoordinator` `verifyPerms` context-mismatch check under `DROIDLOOM_CELL` while preserving mode and ownership checks, so both `x86_64` and `aarch64` images avoid `system_server` boot crash loops without a separate `fedora-classpath-compat` override.
 
-Staging `/usr/lib/droidloom/fedora-classpath-compat` (derived from `com.android.tethering` `classpath-compat` with `ClatCoordinator` context-mismatch checks relaxed under `DROIDLOOM_CELL`) and overriding `/droidloom/classpath-compat` avoids `system_server` boot crash loops.
-
-### 3. Adreno 830 (`A8XX`) `minigbm` UBWC Mitigation
-Android's prebuilt `libminigbm_gralloc.so` (`backend_msm`) computes `DRM_FORMAT_MOD_QCOM_COMPRESSED` (UBWC) buffer sizes using Adreno 6xx `64x16` macrotile alignment (`32,563,200` bytes at `3392x2400`), whereas Adreno 830 Turnip writes `96x32` UBWC (`33,177,600` bytes), causing an Adreno SMMU fault and kernel GPU recovery deadlock.
+### 3. `aarch64` Adreno 830 (`A8XX`) `minigbm` UBWC Mitigation
+On Qualcomm Snapdragon 8 Elite (`SM8750` / Adreno 830 `/dev/dri/renderD128` via `msm_dpu`), Android's prebuilt `libminigbm_gralloc.so` (`backend_msm`) computes `DRM_FORMAT_MOD_QCOM_COMPRESSED` (UBWC) buffer sizes using Adreno 6xx `64x16` macrotile alignment (`32,563,200` bytes at `3392x2400`), whereas Adreno 830 Turnip writes `96x32` UBWC (`33,177,600` bytes), causing an Adreno SMMU fault and kernel GPU recovery deadlock.
 
 Do **not** switch to `vendor.minigbm.allocator=dma_heap_images`, because `dma_heap_images` allocates unpadded-height buffers (for example `2,244,608` bytes at `548x974`) that are 4 KiB smaller than Turnip's overrun guard-page requirement (`2,248,704` bytes), crashing `SurfaceFlinger` `RenderEngine` on multi-layer dialogs/overlays.
 
-Instead, keep the default `backend_msm` allocator (`/dev/dri/renderD128` linear GEM BOs with `64x64` width/height alignment) and disable UBWC compression in the staged `/usr/lib/droidloom/fedora-init.rc` (`early-init`) and `/usr/lib/droidloom/fedora-vendor-build.prop`:
+For `aarch64`, `droidloom-package build-rpm` keeps the default `backend_msm` allocator and stages `/usr/lib/droidloom/fedora-init.rc` (`export vendor.minigbm.debug nocompression`) and `/usr/lib/droidloom/fedora-vendor-build.prop` (`vendor.minigbm.debug=nocompression`), wiring them into `cell-template.json`. `x86_64` does not include or apply this Adreno workaround.
 
-- In `fedora-init.rc`:
-  ```rc
-  export DROIDLOOM_CELL 1
-  export vendor.minigbm.debug nocompression
-  ```
-- In `fedora-vendor-build.prop`:
-  ```ini
-  vendor.minigbm.debug=nocompression
-  ```
+### 4. `x86_64` Notes (Intel / AMD / NVIDIA & NativeBridge)
+- **GPU**: `droidloom_x86_64` supports AMD (`amdgpu` / RadeonSI + RADV), NVIDIA (`nvidia` via `droidloom-gpu-server`), and Intel (`i915`/`xe` / Mesa Iris GLES). Note that `droidloom_x86_64` currently builds Mesa Vulkan only for AMD (`vulkan.radeon`), so Intel GPUs run HWUI and apps via Iris OpenGL ES unless Intel ANV is added.
+- **NativeBridge**: `x86_64` builds include source-built Digitalis/Berberis (`libberberis_arm64.so`) for ARM64 apps; validate SELinux `Enforcing` logs (`ausearch -m avc`) on first ARM64 app launch.
 
-### 4. `firewalld` Outbound Forwarding
+### 5. `firewalld` Outbound Forwarding
 Place [droidloom.xml](firewalld/zones/droidloom.xml) under `/usr/lib/firewalld/zones/` and [droidloom-egress.xml](firewalld/policies/droidloom-egress.xml) under `/usr/lib/firewalld/policies/`, then reload `firewalld` (`firewall-cmd --reload`, handled by `%post`).
 
-## Building `droidloom-wayland` & RPMs (Rootless Podman)
+## Building Fedora RPMs (Rootless Podman)
+
+Full build on `x86_64` (or `aarch64`) inside the Fedora 45 builder container:
 
 ```sh
-podman build -t localhost/droidloom-wayland-builder:fc45 - <<'EOF'
-FROM registry.fedoraproject.org/fedora:45
-RUN dnf install -y --setopt=install_weak_deps=False \
-    rust cargo gcc pkgconf-pkg-config \
-    wayland-devel libxkbcommon-devel mesa-libgbm-devel libdrm-devel && \
-    dnf clean all
-EOF
-
-podman run --rm -v "$PWD:/src:Z" -w /src localhost/droidloom-wayland-builder:fc45 \
-  cargo build --locked --release -j 6 -p droidloom-wayland --bin droidloom-wayland
-
-rpmbuild --define "_topdir $PWD/.work/fedora/rpmbuild" \
-         --define "stage_dir $PWD/.work/fedora/stage-runtime" \
-         -bb packaging/fedora/droidloom-runtime.spec
-
-rpmbuild --define "_topdir $PWD/.work/fedora/rpmbuild" \
-         --define "stage_dir $PWD/.work/fedora/stage-image" \
-         -bb packaging/fedora/droidloom-image.spec
+cargo run --locked -j 1 -p droidloom-package -- build-rpm
 ```
 
-Install both packages on the host with `rpm -Uvh --nosignature`, then configure desktop-mode sizing:
+To reuse an already-staged `droidloom-update package-stage` directory (recompiling host binaries natively inside Fedora 45 without rebuilding AOSP):
+
+```sh
+cargo run --locked -j 1 -p droidloom-package -- build-rpm --payload /path/to/package-stage
+```
+
+Built RPMs are written to `dist/fedora/<version>-<release>/<arch>/`. Install both packages on the host with `sudo dnf install ...`, then configure desktop-mode sizing:
 
 ```sh
 mkdir -p ~/.config/droidloom

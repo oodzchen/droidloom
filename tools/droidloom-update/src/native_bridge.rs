@@ -182,6 +182,32 @@ cc_prebuilt_library_shared {{
             "",
         ),
     )?;
+    // On Android with Bionic + ART libsigchain, old_host_sa->sa_restorer can point
+    // to unreadable/non-canonical memory. Dereferencing it via memcmp() inside
+    // GuestSignalAction::Change() triggers a synchronous SIGSEGV while
+    // SetGuestSignalHandler() holds GetSignalActionsGuardMutex(), re-entering
+    // HandleHostSignal -> FindSignalHandler() and deadlocking the thread (e.g.
+    // ShadowHook.nativeInit in NetEase Music). ARM64 already strips SA_RESTORER
+    // and resets the guest restorer unconditionally, so skip the host probe.
+    let signal_action = bridge.join("guest_os_primitives/guest_signal_action.cc");
+    let signal_action_src = fs::read_to_string(&signal_action)?;
+    let sa_start = "  // We don't support SA_RESTORER flag for non-canonical handlers.  See: b/36458045\n  if (bool(host_sa->sa_flags & SA_RESTORER)) {\n";
+    let sa_end = "    }\n  }\n\n  guest_sa->sa_flags = host_sa->sa_flags & ~SA_RESTORER;\n";
+    if !signal_action_src.contains(sa_start) || !signal_action_src.contains(sa_end) {
+        return fail("unexpected guest_signal_action.cc SA_RESTORER check layout");
+    }
+    let signal_action_patched = signal_action_src
+        .replacen(
+            sa_start,
+            "  // We don't support SA_RESTORER flag for non-canonical handlers.  See: b/36458045\n#if !defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)\n  if (bool(host_sa->sa_flags & SA_RESTORER)) {\n",
+            1,
+        )
+        .replacen(
+            sa_end,
+            "    }\n  }\n#endif\n\n  guest_sa->sa_flags = host_sa->sa_flags & ~SA_RESTORER;\n",
+            1,
+        );
+    projection.put(&signal_action, signal_action_patched)?;
     // Android 17 moved these declarations; Digitalis still keeps them in
     // runtime_primitives. Adapt the header dependency and the three include paths.
     let support = source.join("frameworks/libs/native_bridge_support");

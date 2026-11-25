@@ -1644,6 +1644,13 @@ fn discover_power_supply_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, D
         if !POWER_SUPPLY_TYPES.contains(&kind.trim()) {
             continue;
         }
+        // Peripheral batteries (e.g. wireless mice/keyboards/controllers) report
+        // scope=Device and must not be projected as the host system battery.
+        if fs::read_to_string(source.join("scope"))
+            .is_ok_and(|scope| scope.trim().eq_ignore_ascii_case("Device"))
+        {
+            continue;
+        }
         for attribute in POWER_SUPPLY_ATTRIBUTES {
             let source_file = source.join(attribute);
             if fs::metadata(&source_file).is_ok_and(|metadata| metadata.is_file()) {
@@ -2966,7 +2973,8 @@ mod tests {
         let battery = root.path().join("battery");
         let usb = root.path().join("usb");
         let ignored = root.path().join("charge_pump");
-        for directory in [&battery, &usb, &ignored] {
+        let mouse = root.path().join("hidpp_battery_0");
+        for directory in [&battery, &usb, &ignored, &mouse] {
             fs::create_dir(directory).unwrap();
         }
         fs::write(battery.join("type"), "Battery\n").unwrap();
@@ -2977,6 +2985,10 @@ mod tests {
         fs::write(usb.join("online"), "0\n").unwrap();
         fs::write(ignored.join("type"), "Unknown\n").unwrap();
         fs::write(ignored.join("online"), "1\n").unwrap();
+        fs::write(mouse.join("type"), "Battery\n").unwrap();
+        fs::write(mouse.join("scope"), "Device\n").unwrap();
+        fs::write(mouse.join("status"), "Discharging\n").unwrap();
+        fs::write(mouse.join("online"), "1\n").unwrap();
 
         let selected = discover_power_supply_files(root.path())
             .unwrap()

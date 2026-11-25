@@ -137,9 +137,29 @@ def run_orientation_daemon() -> int:
             apply_if_valid(str(props["AccelerometerOrientation"]))
 
     proxy.connect("g-properties-changed", on_properties_changed)
+    if proxy.get_name_owner() is None:
+        print(
+            "droidloom-orientation-sync: net.hadess.SensorProxy is unavailable; exiting cleanly",
+            file=sys.stderr,
+        )
+        return 0
+    has_accel = proxy.get_cached_property("HasAccelerometer")
+    if has_accel is not None and not bool(has_accel.unpack()):
+        print(
+            "droidloom-orientation-sync: host reports no accelerometer; exiting cleanly",
+            file=sys.stderr,
+        )
+        return 0
     try:
         proxy.call_sync("ClaimAccelerometer", None, Gio.DBusCallFlags.NONE, 3000, None)
     except Exception as exc:
+        err_text = str(exc)
+        if "ServiceUnknown" in err_text or "NameHasNoOwner" in err_text:
+            print(
+                f"droidloom-orientation-sync: iio-sensor-proxy unavailable ({exc}); exiting cleanly",
+                file=sys.stderr,
+            )
+            return 0
         print(f"droidloom-orientation-sync: ClaimAccelerometer failed: {exc}", file=sys.stderr)
         return 1
 

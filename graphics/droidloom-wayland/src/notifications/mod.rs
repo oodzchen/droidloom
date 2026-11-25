@@ -59,8 +59,8 @@ impl Bridge {
                         .await;
                         match result {
                             Ok(()) => break,
-                            Err(_) => eprintln!(
-                                "Droidloom notifications: session bus disconnected; retrying"
+                            Err(error) => eprintln!(
+                                "Droidloom notifications: session bus disconnected ({error}); retrying"
                             ),
                         }
                         let stop = future::race(
@@ -490,7 +490,32 @@ async fn upsert(
     record.version = note.version.clone();
     record.note = Some(note.clone());
     if !state.owner.is_empty() && !record.hidden && (changed || record.id.is_none()) {
-        record.id = Some(desktop.notify(&note, record.id.unwrap_or(0), quiet).await?);
+        let replaces = record.id.unwrap_or(0);
+        match desktop.notify(&note, replaces, quiet).await {
+            Ok(id) => record.id = Some(id),
+            Err(zbus::Error::MethodError(name, msg, _)) => {
+                if replaces != 0 {
+                    match desktop.notify(&note, 0, quiet).await {
+                        Ok(id) => record.id = Some(id),
+                        Err(zbus::Error::MethodError(retry_name, retry_msg, _)) => {
+                            eprintln!(
+                                "Droidloom notifications: desktop Notify rejected ({retry_name}: {})",
+                                retry_msg.as_deref().unwrap_or("")
+                            );
+                            record.id = None;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                } else {
+                    eprintln!(
+                        "Droidloom notifications: desktop Notify rejected ({name}: {})",
+                        msg.as_deref().unwrap_or("")
+                    );
+                    record.id = None;
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
     Ok(())
 }

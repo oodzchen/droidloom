@@ -576,6 +576,9 @@ impl App {
         let Some(task) = self.tasks.get(&object) else {
             return Ok(());
         };
+        if task.closing {
+            return Ok(());
+        }
         if task.headless() {
             return self.update_new_task_density(object);
         }
@@ -603,7 +606,7 @@ impl App {
         let bootstrap = self
             .tasks
             .iter()
-            .find_map(|(object, task)| task.headless().then_some(*object));
+            .find_map(|(object, task)| (task.headless() && !task.closing).then_some(*object));
         bootstrap.map_or(Ok(()), |bootstrap| self.update_new_task_density(bootstrap))
     }
 
@@ -613,9 +616,13 @@ impl App {
     /// most likely opens where the last one got its density; with no window
     /// open it is the density of the largest output.
     fn update_new_task_density(&mut self, bootstrap: TaskObjectId) -> Result<(), PresenterError> {
+        if self.tasks.get(&bootstrap).is_none_or(|task| task.closing) {
+            return Ok(());
+        }
         let last = self
             .density_task
             .and_then(|object| self.tasks.get(&object))
+            .filter(|task| !task.closing)
             .and_then(|task| task.density_dpi);
         let Some(dpi) = last.or_else(|| self.largest_output_density()) else {
             return Ok(());
@@ -653,13 +660,16 @@ impl App {
     }
 
     fn update_task_refresh(&mut self, object: TaskObjectId) -> Result<(), PresenterError> {
+        if self.tasks.get(&object).is_none_or(|task| task.closing) {
+            return Ok(());
+        }
         self.update_task_density(object)?;
         let refresh = self.task_refresh_millihz(object);
         let task = self
             .tasks
             .get_mut(&object)
             .ok_or(PresenterError::UnknownTask(object))?;
-        if task.configure_serial == 0 || task.refresh_millihz == refresh {
+        if task.closing || task.configure_serial == 0 || task.refresh_millihz == refresh {
             return Ok(());
         }
         // A cadence change preserves the configure's allocation generation.
@@ -679,10 +689,9 @@ impl App {
             )?;
         task.refresh_millihz = refresh;
         if task.package != BOOTSTRAP_PACKAGE {
-            let bootstrap = self
-                .tasks
-                .iter()
-                .find_map(|(object, task)| (task.package == BOOTSTRAP_PACKAGE).then_some(*object));
+            let bootstrap = self.tasks.iter().find_map(|(object, task)| {
+                (task.package == BOOTSTRAP_PACKAGE && !task.closing).then_some(*object)
+            });
             if let Some(bootstrap) = bootstrap {
                 self.update_task_refresh(bootstrap)?;
             }
@@ -691,7 +700,12 @@ impl App {
     }
 
     fn update_output_refreshes(&mut self) -> Result<(), PresenterError> {
-        let objects = self.tasks.keys().copied().collect::<Vec<_>>();
+        let objects = self
+            .tasks
+            .iter()
+            .filter(|(_, task)| !task.closing)
+            .map(|(object, _)| *object)
+            .collect::<Vec<_>>();
         for object in objects {
             self.update_task_refresh(object)?;
         }
@@ -1025,6 +1039,9 @@ impl App {
                 .tasks
                 .get(&object)
                 .ok_or(PresenterError::UnknownTask(object))?;
+            if task.closing {
+                return Ok(());
+            }
             task.configure_serial == 0
                 || configure.changes_geometry(task.logical_size, task.applied_scale_120)
                 || task.buffer_size != (buffer_width, buffer_height)
@@ -2472,7 +2489,7 @@ impl App {
     /// window keeps Android's buffers, as before this hand-over existed.
     fn hide_overdue(&mut self, now: Instant) -> Result<(), PresenterError> {
         for (object, task) in &mut self.tasks {
-            if task.hide_due.is_none_or(|due| now < due) {
+            if task.closing || task.hide_due.is_none_or(|due| now < due) {
                 continue;
             }
             task.hide_due = None;
@@ -2497,7 +2514,9 @@ impl App {
             && let Some(task) = self.tasks.get_mut(&previous)
         {
             task.focused = false;
-            if let Some(endpoint) = self.endpoint.as_ref() {
+            if !task.closing
+                && let Some(endpoint) = self.endpoint.as_ref()
+            {
                 endpoint.send_visibility(previous, task.visibility(), false)?;
             }
         }
@@ -2505,6 +2524,7 @@ impl App {
         self.update_text_input();
         if let Some(object) = object
             && let Some(task) = self.tasks.get_mut(&object)
+            && !task.closing
         {
             task.focused = true;
             if let Some(endpoint) = self.endpoint.as_ref() {
@@ -2632,9 +2652,11 @@ impl Dispatch<WpFractionalScaleV1, TaskObjectId> for App {
 impl WindowHandler for App {
     fn request_close(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, window: &Window) {
         let object = self.tasks.iter().find_map(|(object, task)| {
-            task.window
-                .as_ref()
-                .is_some_and(|candidate| candidate.wl_surface() == window.wl_surface())
+            (!task.closing
+                && task
+                    .window
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.wl_surface() == window.wl_surface()))
                 .then_some(*object)
         });
         if let Some(object) = object

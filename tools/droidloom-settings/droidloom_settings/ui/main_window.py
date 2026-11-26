@@ -38,7 +38,9 @@ PAGE_KEYS = [
 class MainWindow(QtWidgets.QMainWindow):
     """Droidloom Settings primary GUI window."""
 
-    def __init__(self, initial_page: str = "overview") -> None:
+    def __init__(
+        self, initial_page: str = "overview", initial_package: str | None = None
+    ) -> None:
         super().__init__()
         self.setWindowTitle("Droidloom 设置")
         self.setMinimumSize(560, 420)
@@ -155,6 +157,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         idx = next((i for i, (k, _) in enumerate(PAGE_KEYS) if k == initial_page), 0)
         self.nav.setCurrentRow(idx)
+        if initial_package:
+            self.page_apps.select_package(initial_package)
 
         self._poll_timer = QtCore.QTimer(self)
         self._poll_timer.setInterval(3000)

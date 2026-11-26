@@ -26,6 +26,12 @@ PySide6 (Qt 6) desktop control center, graphical APK installer, `.apk` MIME hand
   - Registers `org.droidloom.ApkInstaller.desktop` as the default handler for `application/vnd.android.package-archive` (`.apk`).
   - Installed app browser with icons, size details, force-stop/clear cache/clear data/uninstall, and per-app window size + `X-Droidloom-Resolution` configuration.
 - **Diagnostics**: Live Android logcat & crash buffer viewer, `droidloom-doctor` check table, and systemd journal viewer.
+- **KDE Plasma 6 Control Center Widget (`org.droidloom.ControlCenter`)**:
+  - System tray & panel Plasmoid sharing the same `droidloom_settings` backend via session D-Bus service `org.droidloom.ControlCenter` (`droidloom-panel-daemon` / `droidloom-panel.service`).
+  - **Quick Settings**: Container start/stop, dark mode, Android DND, screen rotation, desktop/mobile window mode, ANGLE/Mesa game driver, PipeWire mic capture, and Android Settings.
+  - **Live Notifications**: Consumes `org.droidloom.Notifications` exported by `droidloom-wayland` (with automatic ADB fallback) to display ongoing + normal notifications, progress bars, MessagingStyle lines, action buttons, and a desktop popup forwarding toggle.
+  - **Running Tasks & Background Services**: Inspect active/recent tasks and foreground/background services with RSS memory usage, switch/launch, force-stop, and batch background cleanup.
+  - **All Apps Drawer**: Searchable grid with cached icons, quick launch, force-stop, and deep-linking into `droidloom-settings --page apps --package <pkg>`.
 
 ## User Installation
 
@@ -33,4 +39,4 @@ PySide6 (Qt 6) desktop control center, graphical APK installer, `.apk` MIME hand
 bash tools/droidloom-settings/install-user.sh
 ```
 
-This installs `droidloom-settings` and `droidloom-apk-installer` into `~/.local/bin/`, desktop entries into `~/.local/share/applications/`, multi-size `hicolor` PNG/SVG icons (`16x16`–`512x512`, `@2`, `scalable`, both `apps` and `mimetypes`) into `~/.local/share/icons/hicolor/`, the Shared MIME-info icon association into `~/.local/share/mime/packages/org.droidloom.ApkInstaller.xml`, the orientation sync service into `~/.config/systemd/user/`, and sets `org.droidloom.ApkInstaller.desktop` as the default `.apk` opener.
+This installs `droidloom-settings`, `droidloom-apk-installer`, and `droidloom-panel-daemon` into `~/.local/bin/`, the Plasma 6 widget (`org.droidloom.ControlCenter`) via `kpackagetool6`, D-Bus activation (`org.droidloom.ControlCenter.service`), desktop entries into `~/.local/share/applications/`, multi-size `hicolor` PNG/SVG icons (`16x16`–`512x512`, `@2`, `scalable`, both `apps` and `mimetypes`) into `~/.local/share/icons/hicolor/`, the Shared MIME-info icon association into `~/.local/share/mime/packages/org.droidloom.ApkInstaller.xml`, the systemd user units into `~/.config/systemd/user/`, and sets `org.droidloom.ApkInstaller.desktop` as the default `.apk` opener.

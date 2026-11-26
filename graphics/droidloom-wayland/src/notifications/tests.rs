@@ -743,3 +743,157 @@ fn actions_survive_rate_limit_and_popup_expiry_and_dedup_unchanged_posts() {
         .await;
     });
 }
+
+#[test]
+fn panel_dbus_interface_snapshot_actions_and_forwarding_toggle() {
+    let mut child = Command::new("dbus-daemon")
+        .args(["--session", "--nofork", "--print-address=1"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut address = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut address)
+        .unwrap();
+    let _bus = Bus(child);
+    future::block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notification.sock");
+        let listener = Async::new(UnixListener::bind(&path).unwrap()).unwrap();
+        let (tx, rx) = async_channel::bounded(128);
+        let server = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .name(NAME)
+            .unwrap()
+            .serve_at(
+                PATH,
+                Server {
+                    next: Arc::new(AtomicU32::new(500)),
+                    events: tx.clone(),
+                },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let _keep_server = &server;
+        let conn = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let client_conn = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let state = dir.path().join("state");
+        let grants = HostGrants::default();
+        let bridge = serve(&listener, &state, conn, unsafe { libc::getuid() }, &grants);
+        let checks = async {
+            let panel = Proxy::new(&client_conn, PANEL_NAME, PANEL_PATH, PANEL_NAME)
+                .await
+                .unwrap();
+            let socket = Async::<UnixStream>::connect(&path).await.unwrap();
+            frame(&socket, serde_json::json!({"type":"hello","abi":3})).await;
+            assert_eq!(
+                reply(&socket).await,
+                serde_json::json!({"type":"hello","abi":3})
+            );
+
+            let mut ongoing = note("v1");
+            ongoing.key = "0|music.app|1".into();
+            ongoing.package = "music.app".into();
+            ongoing.ongoing = true;
+            ongoing.clearable = false;
+            ongoing.when = 1_700_000_000_100;
+
+            let mut normal = note("v2");
+            normal.key = "0|chat.app|2".into();
+            normal.package = "chat.app".into();
+            normal.ongoing = false;
+            normal.clearable = true;
+            normal.when = 1_700_000_000_500;
+
+            snapshot(&socket, &[normal.clone(), ongoing.clone()]).await;
+            let _ = timeout(rx.recv()).await.unwrap();
+            let _ = timeout(rx.recv()).await.unwrap();
+
+            let raw: String = panel.call("GetSnapshot", &()).await.unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(parsed["connected"], true);
+            assert_eq!(parsed["desktop_forwarding"], true);
+            let list = parsed["notifications"].as_array().unwrap();
+            assert_eq!(list.len(), 2);
+            // Ongoing notifications come before normal ones even with older timestamp.
+            assert_eq!(list[0]["key"], "0|music.app|1");
+            assert_eq!(list[1]["key"], "0|chat.app|2");
+
+            // InvokeAction forwards to Android socket.
+            let invoked: bool = panel
+                .call("InvokeAction", &("0|chat.app|2", "action-0"))
+                .await
+                .unwrap();
+            assert!(invoked);
+            let act = reply(&socket).await;
+            assert_eq!(act["type"], "action");
+            assert_eq!(act["action"], "action-0");
+
+            // DismissAll only cancels clearable notification, sparing ongoing one.
+            let dismissed_count: u32 = panel.call("DismissAll", &()).await.unwrap();
+            assert_eq!(dismissed_count, 1);
+            let dismiss_msg = reply(&socket).await;
+            assert_eq!(dismiss_msg["type"], "dismiss");
+            assert_eq!(dismiss_msg["key"], "0|chat.app|2");
+            match timeout(rx.recv()).await.unwrap() {
+                Observed::Closed(_) => {}
+                other @ Observed::Posted(..) => panic!("expected desktop close, got {other:?}"),
+            }
+            let after_dismiss: serde_json::Value =
+                serde_json::from_str(&panel.call::<_, _, String>("GetSnapshot", &()).await.unwrap())
+                    .unwrap();
+            let after_list = after_dismiss["notifications"].as_array().unwrap();
+            assert_eq!(after_list.len(), 1);
+            assert_eq!(after_list[0]["key"], "0|music.app|1");
+
+            // Disabling desktop forwarding suppresses new desktop Notify calls.
+            let fwd: bool = panel.call("SetDesktopForwarding", &(false)).await.unwrap();
+            assert!(!fwd);
+            match timeout(rx.recv()).await.unwrap() {
+                Observed::Closed(_) => {}
+                other @ Observed::Posted(..) => {
+                    panic!("expected ongoing desktop close, got {other:?}")
+                }
+            }
+
+            let mut third = note("v3");
+            third.key = "0|mail.app|3".into();
+            third.package = "mail.app".into();
+            frame(
+                &socket,
+                serde_json::json!({"type":"post","notification":third}),
+            )
+            .await;
+            quiet(&rx).await;
+
+            let raw2: String = panel.call("GetSnapshot", &()).await.unwrap();
+            let parsed2: serde_json::Value = serde_json::from_str(&raw2).unwrap();
+            assert_eq!(parsed2["desktop_forwarding"], false);
+            assert!(
+                parsed2["notifications"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n["key"] == "0|mail.app|3")
+            );
+        };
+        future::race(
+            async {
+                bridge.await.unwrap();
+                panic!("bridge stopped")
+            },
+            checks,
+        )
+        .await;
+    });
+}

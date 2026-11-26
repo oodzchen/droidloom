@@ -256,12 +256,25 @@ class AppsApkPage(QtWidgets.QWidget):
         root.addStretch(1)
 
         self._loaded = False
+        self._pending_package: str | None = None
         self.refresh_mime_status()
 
     def ensure_loaded(self) -> None:
         if not self._loaded:
             self._loaded = True
             self.refresh_apps()
+
+    def select_package(self, package: str) -> None:
+        self._pending_package = package.strip() or None
+        if self._pending_package is None:
+            return
+        for row in range(self.app_list.count()):
+            item = self.app_list.item(row)
+            app = item.data(QtCore.Qt.ItemDataRole.UserRole) if item else None
+            if isinstance(app, dict) and app.get("package") == self._pending_package:
+                self.app_list.setCurrentRow(row)
+                self._pending_package = None
+                return
 
     def _hbox(self, w1: QtWidgets.QWidget, w2: QtWidgets.QWidget) -> QtWidgets.QWidget:
         box = QtWidgets.QWidget()
@@ -344,6 +357,14 @@ class AppsApkPage(QtWidgets.QWidget):
             pm = pixmap_from_bytes(self._icons.get(app.get("component", "")), 36)
             item.setIcon(QtGui.QIcon(pm))
             self.app_list.addItem(item)
+        if self._pending_package:
+            for row in range(self.app_list.count()):
+                item = self.app_list.item(row)
+                app = item.data(QtCore.Qt.ItemDataRole.UserRole) if item else None
+                if isinstance(app, dict) and app.get("package") == self._pending_package:
+                    self.app_list.setCurrentRow(row)
+                    self._pending_package = None
+                    break
 
     def _on_app_selected(self, item: QtWidgets.QListWidgetItem | None) -> None:
         if item is None:

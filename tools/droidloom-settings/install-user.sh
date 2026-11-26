@@ -29,6 +29,12 @@ find "$APP_SHARE/droidloom_settings" -type d -name '__pycache__' -exec rm -rf {}
 
 SETTINGS_BIN="$BIN_DIR/droidloom-settings"
 INSTALLER_BIN="$BIN_DIR/droidloom-apk-installer"
+PANEL_DAEMON_BIN="$BIN_DIR/droidloom-panel-daemon"
+DBUS_SERVICE_DIR="$DATA_HOME/dbus-1/services"
+PLASMOID_DIR="$DATA_HOME/plasma/plasmoids"
+PLASMOID_ID="org.droidloom.ControlCenter"
+
+mkdir -p "$DBUS_SERVICE_DIR" "$PLASMOID_DIR"
 
 cat > "$SETTINGS_BIN" <<EOF
 #!/usr/bin/env bash
@@ -48,6 +54,13 @@ fi
 EOF
 chmod 0755 "$INSTALLER_BIN"
 
+cat > "$PANEL_DAEMON_BIN" <<EOF
+#!/usr/bin/env bash
+export PYTHONPATH="$APP_SHARE\${PYTHONPATH:+:\$PYTHONPATH}"
+exec /usr/bin/python3 -B -m droidloom_settings.main --panel-daemon "\$@"
+EOF
+chmod 0755 "$PANEL_DAEMON_BIN"
+
 if [ ! -f "$HICOLOR_DIR/index.theme" ] && [ -f /usr/share/icons/hicolor/index.theme ]; then
   install -m 0644 /usr/share/icons/hicolor/index.theme "$HICOLOR_DIR/index.theme"
 fi
@@ -64,14 +77,16 @@ if [ "$missing_png" -eq 1 ]; then
   /usr/bin/python3 "$SCRIPT_DIR/scripts/generate_icons.py"
 fi
 
-# Install scalable SVG icons (apps + mimetypes)
-mkdir -p "$HICOLOR_DIR/scalable/apps" "$HICOLOR_DIR/scalable/mimetypes"
+# Install scalable SVG icons (apps + mimetypes + symbolic)
+mkdir -p "$HICOLOR_DIR/scalable/apps" "$HICOLOR_DIR/scalable/mimetypes" "$HICOLOR_DIR/symbolic/apps"
 install -m 0644 "$SCRIPT_DIR/assets/${ICON_NAME}.svg" \
   "$HICOLOR_DIR/scalable/apps/${ICON_NAME}.svg"
 install -m 0644 "$SCRIPT_DIR/assets/${ICON_NAME}.svg" \
   "$HICOLOR_DIR/scalable/mimetypes/${ICON_NAME}.svg"
 install -m 0644 "$SCRIPT_DIR/assets/${ICON_NAME}.svg" \
   "$HICOLOR_DIR/scalable/mimetypes/${APK_MIME_ICON}.svg"
+install -m 0644 "$SCRIPT_DIR/assets/org.droidloom.ControlCenter-symbolic.svg" \
+  "$HICOLOR_DIR/symbolic/apps/org.droidloom.ControlCenter-symbolic.svg"
 
 # Install multi-size crisp PNG icons (apps + mimetypes)
 for s in "${ICON_SIZES[@]}"; do
@@ -109,6 +124,28 @@ sed "s|@SETTINGS_EXEC@|$SETTINGS_BIN|g" \
   "$SCRIPT_DIR/assets/droidloom-orientation-sync.service" > "$USER_UNIT_DIR/droidloom-orientation-sync.service"
 chmod 0644 "$USER_UNIT_DIR/droidloom-orientation-sync.service"
 
+sed "s|@PANEL_DAEMON_EXEC@|$PANEL_DAEMON_BIN|g" \
+  "$SCRIPT_DIR/assets/droidloom-panel.service" > "$USER_UNIT_DIR/droidloom-panel.service"
+chmod 0644 "$USER_UNIT_DIR/droidloom-panel.service"
+
+sed "s|@PANEL_DAEMON_EXEC@|$PANEL_DAEMON_BIN|g" \
+  "$SCRIPT_DIR/assets/org.droidloom.ControlCenter.service" > "$DBUS_SERVICE_DIR/org.droidloom.ControlCenter.service"
+chmod 0644 "$DBUS_SERVICE_DIR/org.droidloom.ControlCenter.service"
+
+if command -v kpackagetool6 >/dev/null 2>&1; then
+  if [ -d "$PLASMOID_DIR/$PLASMOID_ID" ]; then
+    kpackagetool6 --type Plasma/Applet --upgrade "$SCRIPT_DIR/plasmoid" >/dev/null 2>&1 || {
+      rm -rf "$PLASMOID_DIR/$PLASMOID_ID"
+      kpackagetool6 --type Plasma/Applet --install "$SCRIPT_DIR/plasmoid"
+    }
+  else
+    kpackagetool6 --type Plasma/Applet --install "$SCRIPT_DIR/plasmoid"
+  fi
+else
+  rm -rf "$PLASMOID_DIR/$PLASMOID_ID"
+  cp -a "$SCRIPT_DIR/plasmoid" "$PLASMOID_DIR/$PLASMOID_ID"
+fi
+
 if command -v update-mime-database >/dev/null 2>&1; then
   update-mime-database "$MIME_DIR" || true
 fi
@@ -127,10 +164,17 @@ if command -v kbuildsycoca6 >/dev/null 2>&1; then
 fi
 if command -v systemctl >/dev/null 2>&1; then
   systemctl --user daemon-reload >/dev/null 2>&1 || true
+  systemctl --user reload dbus.service >/dev/null 2>&1 || true
+  systemctl --user enable --now droidloom-panel.service >/dev/null 2>&1 || true
+  if systemctl --user is-active --quiet droidloom-panel.service; then
+    systemctl --user restart droidloom-panel.service >/dev/null 2>&1 || true
+  fi
 fi
 
 mime_icon_line="$(grep -m1 "^${APK_MIME}:" "$MIME_DIR/icons" 2>/dev/null || echo unknown)"
 echo "Installed Droidloom Settings to $SETTINGS_BIN"
 echo "Installed Droidloom APK Installer to $INSTALLER_BIN"
+echo "Installed Droidloom Panel D-Bus Daemon to $PANEL_DAEMON_BIN"
+echo "Installed Plasma 6 Widget ($PLASMOID_ID) to $PLASMOID_DIR/$PLASMOID_ID"
 echo "Default APK handler: $(xdg-mime query default "$APK_MIME" 2>/dev/null || echo unknown)"
 echo "APK MIME icon: $mime_icon_line"

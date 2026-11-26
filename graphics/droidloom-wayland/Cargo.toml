@@ -36,6 +36,7 @@ tempfile.workspace = true
 url = "2.5.8"
 zbus = { version = "5.18.0", default-features = false, features = ["async-io"] }
 async-io = "2.6.0"
+async-channel = "2.5.0"
 futures-lite = "2.6.1"
 
 [lints.rust]
@@ -50,7 +51,6 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 
 [dev-dependencies]
-async-channel = "2.5.0"
 wayland-server = "0.31.13"
 wayland-protocols = { workspace = true, features = ["server"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["server"] }

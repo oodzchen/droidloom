@@ -17,11 +17,17 @@ use std::{
         },
     },
     path::PathBuf,
+    sync::{Arc, RwLock},
     time::Duration,
 };
-use zbus::{Connection, MatchRule, Message, MessageStream, Proxy, message::Type, zvariant::Value};
+use zbus::{
+    Connection, MatchRule, Message, MessageStream, Proxy, message::Type,
+    object_server::InterfaceRef, zvariant::Value,
+};
 const NAME: &str = "org.freedesktop.Notifications";
 const PATH: &str = "/org/freedesktop/Notifications";
+const PANEL_NAME: &str = "org.droidloom.Notifications";
+const PANEL_PATH: &str = "/org/droidloom/Notifications";
 // Room for a 96 px large icon in hex next to the longest texts.
 const MAX_FRAME: usize = 262144;
 const MAX_ACTIVE: usize = 256;
@@ -313,6 +319,8 @@ struct Record {
     version: String,
     hidden: bool,
     #[serde(skip)]
+    dismissed: bool,
+    #[serde(skip)]
     note: Option<Note>,
 }
 #[derive(Default, Serialize, Deserialize)]
@@ -462,6 +470,7 @@ async fn reconcile(
     state: &mut State,
     snapshot: BTreeMap<String, Note>,
     desktop: &Desktop<'_>,
+    desktop_forwarding: bool,
 ) -> Result<()> {
     let removed: Vec<_> = state
         .records
@@ -477,7 +486,7 @@ async fn reconcile(
         }
     }
     for (key, note) in snapshot {
-        upsert(state, key, note, desktop, true).await?;
+        upsert(state, key, note, desktop, true, desktop_forwarding).await?;
     }
     Ok(())
 }
@@ -506,10 +515,12 @@ async fn upsert(
     note: Note,
     desktop: &Desktop<'_>,
     quiet: bool,
+    desktop_forwarding: bool,
 ) -> Result<()> {
     let record = state.records.entry(key).or_default();
     if record.version != note.version {
         record.hidden = false;
+        record.dismissed = false;
     }
     let changed = record.version != note.version;
     let unchanged_presentation = record.id.is_some()
@@ -521,7 +532,8 @@ async fn upsert(
             .is_some_and(|prev| same_presentation(prev, &note));
     record.version = note.version.clone();
     record.note = Some(note.clone());
-    if !state.owner.is_empty()
+    if desktop_forwarding
+        && !state.owner.is_empty()
         && !record.hidden
         && !unchanged_presentation
         && (changed || record.id.is_none())
@@ -573,11 +585,189 @@ async fn upsert(
     }
     Ok(())
 }
+#[derive(Clone)]
+struct PanelSnapshot {
+    connected: bool,
+    desktop_forwarding: bool,
+    notifications: Vec<Note>,
+}
+
+impl Default for PanelSnapshot {
+    fn default() -> Self {
+        Self {
+            connected: false,
+            desktop_forwarding: true,
+            notifications: Vec::new(),
+        }
+    }
+}
+
+enum PanelCommand {
+    InvokeAction {
+        key: String,
+        action: String,
+        reply: async_channel::Sender<bool>,
+    },
+    Dismiss {
+        key: String,
+        reply: async_channel::Sender<bool>,
+    },
+    DismissAll {
+        reply: async_channel::Sender<u32>,
+    },
+    SetDesktopForwarding {
+        enabled: bool,
+        reply: async_channel::Sender<bool>,
+    },
+}
+
+struct PanelService {
+    snapshot: Arc<RwLock<PanelSnapshot>>,
+    commands: async_channel::Sender<PanelCommand>,
+}
+
+#[zbus::interface(name = "org.droidloom.Notifications")]
+impl PanelService {
+    fn get_snapshot(&self) -> String {
+        let guard = self.snapshot.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        serde_json::json!({
+            "abi": 1,
+            "connected": guard.connected,
+            "desktop_forwarding": guard.desktop_forwarding,
+            "notifications": guard.notifications,
+        })
+        .to_string()
+    }
+
+    async fn invoke_action(&self, key: String, action: String) -> bool {
+        let (tx, rx) = async_channel::bounded(1);
+        if self
+            .commands
+            .send(PanelCommand::InvokeAction {
+                key,
+                action,
+                reply: tx,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        rx.recv().await.unwrap_or(false)
+    }
+
+    async fn dismiss(&self, key: String) -> bool {
+        let (tx, rx) = async_channel::bounded(1);
+        if self
+            .commands
+            .send(PanelCommand::Dismiss { key, reply: tx })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        rx.recv().await.unwrap_or(false)
+    }
+
+    async fn dismiss_all(&self) -> u32 {
+        let (tx, rx) = async_channel::bounded(1);
+        if self
+            .commands
+            .send(PanelCommand::DismissAll { reply: tx })
+            .await
+            .is_err()
+        {
+            return 0;
+        }
+        rx.recv().await.unwrap_or(0)
+    }
+
+    async fn set_desktop_forwarding(&self, enabled: bool) -> bool {
+        let (tx, rx) = async_channel::bounded(1);
+        if self
+            .commands
+            .send(PanelCommand::SetDesktopForwarding { enabled, reply: tx })
+            .await
+            .is_err()
+        {
+            return enabled;
+        }
+        rx.recv().await.unwrap_or(enabled)
+    }
+
+    #[zbus(property)]
+    fn connected(&self) -> bool {
+        self.snapshot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .connected
+    }
+
+    #[zbus(property)]
+    fn desktop_forwarding(&self) -> bool {
+        self.snapshot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .desktop_forwarding
+    }
+
+    #[zbus(property)]
+    fn count(&self) -> u32 {
+        let guard = self.snapshot.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let n = guard.notifications.iter().filter(|note| !note.summary).count();
+        u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
+    #[zbus(signal)]
+    async fn snapshot_changed(
+        emitter: &zbus::object_server::SignalEmitter<'_>,
+    ) -> zbus::Result<()>;
+}
+
+async fn publish_panel_state(
+    snapshot_lock: &Arc<RwLock<PanelSnapshot>>,
+    iface_ref: Option<&InterfaceRef<PanelService>>,
+    state: &State,
+    connected: bool,
+    desktop_forwarding: bool,
+) {
+    let mut notes: Vec<Note> = state
+        .records
+        .values()
+        .filter(|r| !r.dismissed)
+        .filter_map(|r| r.note.clone())
+        .collect();
+    notes.sort_by(|a, b| {
+        b.ongoing
+            .cmp(&a.ongoing)
+            .then_with(|| b.when.cmp(&a.when))
+            .then_with(|| a.key.cmp(&b.key))
+    });
+    let prev_connected = {
+        let mut guard = snapshot_lock
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = guard.connected;
+        guard.connected = connected;
+        guard.desktop_forwarding = desktop_forwarding;
+        guard.notifications = notes;
+        prev
+    };
+    if let Some(iface) = iface_ref {
+        let emitter = iface.signal_emitter();
+        if prev_connected != connected {
+            let _ = iface.get().await.connected_changed(emitter).await;
+        }
+        let _ = PanelService::snapshot_changed(emitter).await;
+    }
+}
+
 enum Event {
     Accept(io::Result<(Async<UnixStream>, std::os::unix::net::SocketAddr)>),
     Data(io::Result<Vec<u8>>),
     Signal(Option<zbus::Result<Message>>),
     Owner(Option<zbus::Result<Message>>),
+    Panel(Option<PanelCommand>),
 }
 async fn read_peer(peer: Option<&Peer>) -> Event {
     let Some(peer) = peer else {
@@ -650,7 +840,35 @@ async fn serve(
         state.bus_id = bus_id;
     }
     state.owner(owner);
+    let panel_snapshot = Arc::new(RwLock::new(PanelSnapshot::default()));
+    let (panel_tx, panel_rx) = async_channel::bounded::<PanelCommand>(64);
+    conn.object_server()
+        .at(
+            PANEL_PATH,
+            PanelService {
+                snapshot: Arc::clone(&panel_snapshot),
+                commands: panel_tx,
+            },
+        )
+        .await?;
+    if let Err(err) = conn.request_name(PANEL_NAME).await {
+        eprintln!("Droidloom notifications: panel D-Bus name unavailable ({err})");
+    }
+    let panel_iface = conn
+        .object_server()
+        .interface::<_, PanelService>(PANEL_PATH)
+        .await
+        .ok();
+    let mut desktop_forwarding = true;
     let mut peer: Option<Peer> = None;
+    publish_panel_state(
+        &panel_snapshot,
+        panel_iface.as_ref(),
+        &state,
+        false,
+        desktop_forwarding,
+    )
+    .await;
     // Denial emits ActivationToken right before ActionInvoked for one tap.
     let mut activation: Option<(u32, String)> = None;
     loop {
@@ -659,9 +877,13 @@ async fn serve(
                 async { Event::Accept(listener.accept().await) },
                 read_peer(peer.as_ref()),
             ),
-            future::race(async { Event::Signal(signals.next().await) }, async {
-                Event::Owner(owners.next().await)
-            }),
+            future::race(
+                future::race(
+                    async { Event::Signal(signals.next().await) },
+                    async { Event::Owner(owners.next().await) },
+                ),
+                async { Event::Panel(panel_rx.recv().await.ok()) },
+            ),
         )
         .await;
         match event {
@@ -678,6 +900,14 @@ async fn serve(
                     synced: false,
                 });
                 eprintln!("Droidloom notifications: Android connected");
+                publish_panel_state(
+                    &panel_snapshot,
+                    panel_iface.as_ref(),
+                    &state,
+                    true,
+                    desktop_forwarding,
+                )
+                .await;
             }
             Event::Accept(Err(e)) => return Err(e.into()),
             Event::Data(Ok(bytes)) if !bytes.is_empty() => {
@@ -693,6 +923,14 @@ async fn serve(
                                 .is_err()
                             {
                                 peer = None;
+                                publish_panel_state(
+                                    &panel_snapshot,
+                                    panel_iface.as_ref(),
+                                    &state,
+                                    false,
+                                    desktop_forwarding,
+                                )
+                                .await;
                                 continue;
                             }
                         }
@@ -700,11 +938,19 @@ async fn serve(
                         for update in snapshots {
                             match update {
                                 Update::Snapshot(snapshot) => {
-                                    reconcile(&mut state, snapshot, &desktop).await?
+                                    reconcile(&mut state, snapshot, &desktop, desktop_forwarding)
+                                        .await?;
                                 }
                                 Update::Post(note) => {
-                                    upsert(&mut state, note.key.clone(), note, &desktop, false)
-                                        .await?
+                                    upsert(
+                                        &mut state,
+                                        note.key.clone(),
+                                        note,
+                                        &desktop,
+                                        false,
+                                        desktop_forwarding,
+                                    )
+                                    .await?;
                                 }
                                 Update::Remove { key, version } => {
                                     if state
@@ -723,6 +969,14 @@ async fn serve(
                         }
                         if changed {
                             state.save(state_path)?;
+                            publish_panel_state(
+                                &panel_snapshot,
+                                panel_iface.as_ref(),
+                                &state,
+                                peer.is_some(),
+                                desktop_forwarding,
+                            )
+                            .await;
                         }
                     }
                     Err(error) => {
@@ -730,10 +984,28 @@ async fn serve(
                             "Droidloom notifications: invalid Android frame ({error}); disconnected"
                         );
                         peer = None;
+                        publish_panel_state(
+                            &panel_snapshot,
+                            panel_iface.as_ref(),
+                            &state,
+                            false,
+                            desktop_forwarding,
+                        )
+                        .await;
                     }
                 }
             }
-            Event::Data(_) => peer = None,
+            Event::Data(_) => {
+                peer = None;
+                publish_panel_state(
+                    &panel_snapshot,
+                    panel_iface.as_ref(),
+                    &state,
+                    false,
+                    desktop_forwarding,
+                )
+                .await;
+            }
             Event::Owner(Some(Ok(message))) => {
                 let (_, _, owner): (String, String, String) = message.body().deserialize()?;
                 if owner == state.owner {
@@ -754,7 +1026,7 @@ async fn serve(
                     .iter()
                     .filter_map(|(k, r)| r.note.clone().map(|n| (k.clone(), n)))
                     .collect();
-                reconcile(&mut state, snapshot, &desktop).await?;
+                reconcile(&mut state, snapshot, &desktop, desktop_forwarding).await?;
                 state.save(state_path)?;
             }
             Event::Signal(Some(Ok(message))) => {
@@ -787,6 +1059,14 @@ async fn serve(
                                 if let Some(p) = peer.as_ref() {
                                     if p.command(note, Some(&action)).await.is_err() {
                                         peer = None;
+                                        publish_panel_state(
+                                            &panel_snapshot,
+                                            panel_iface.as_ref(),
+                                            &state,
+                                            false,
+                                            desktop_forwarding,
+                                        )
+                                        .await;
                                     }
                                 }
                             }
@@ -808,6 +1088,14 @@ async fn serve(
                                 if let (Some(note), Some(p)) = (&record.note, &peer) {
                                     if note.clearable && p.command(note, None).await.is_err() {
                                         peer = None;
+                                        publish_panel_state(
+                                            &panel_snapshot,
+                                            panel_iface.as_ref(),
+                                            &state,
+                                            false,
+                                            desktop_forwarding,
+                                        )
+                                        .await;
                                     }
                                 }
                             }
@@ -817,7 +1105,172 @@ async fn serve(
                     _ => (),
                 }
             }
-            Event::Owner(_) | Event::Signal(_) => return Err("session bus closed".into()),
+            Event::Panel(Some(cmd)) => match cmd {
+                PanelCommand::InvokeAction { key, action, reply } => {
+                    let mut ok = false;
+                    if let Some(note) = state.records.get(&key).and_then(|r| r.note.as_ref()) {
+                        if note.actions.iter().any(|a| a.key == action) {
+                            if let Some(p) = peer.as_ref() {
+                                if p.command(note, Some(&action)).await.is_ok() {
+                                    ok = true;
+                                } else {
+                                    peer = None;
+                                    publish_panel_state(
+                                        &panel_snapshot,
+                                        panel_iface.as_ref(),
+                                        &state,
+                                        false,
+                                        desktop_forwarding,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                    let _ = reply.send(ok).await;
+                }
+                PanelCommand::Dismiss { key, reply } => {
+                    let mut ok = false;
+                    let mut disconnected = false;
+                    if let Some(record) = state.records.get_mut(&key) {
+                        if let Some(note) = record.note.as_ref() {
+                            if note.clearable {
+                                if let Some(p) = peer.as_ref() {
+                                    if p.command(note, None).await.is_ok() {
+                                        ok = true;
+                                    } else {
+                                        disconnected = true;
+                                    }
+                                }
+                            }
+                        }
+                        if ok {
+                            if let Some(id) = record.id.take() {
+                                desktop.close(id).await;
+                            }
+                            record.last_id = None;
+                            record.hidden = true;
+                            record.dismissed = true;
+                            let _ = state.save(state_path);
+                        }
+                    }
+                    if disconnected {
+                        peer = None;
+                        publish_panel_state(
+                            &panel_snapshot,
+                            panel_iface.as_ref(),
+                            &state,
+                            false,
+                            desktop_forwarding,
+                        )
+                        .await;
+                    } else if ok {
+                        publish_panel_state(
+                            &panel_snapshot,
+                            panel_iface.as_ref(),
+                            &state,
+                            peer.is_some(),
+                            desktop_forwarding,
+                        )
+                        .await;
+                    }
+                    let _ = reply.send(ok).await;
+                }
+                PanelCommand::DismissAll { reply } => {
+                    let mut count = 0u32;
+                    let mut disconnected = false;
+                    let keys: Vec<String> = state
+                        .records
+                        .iter()
+                        .filter_map(|(k, r)| {
+                            r.note
+                                .as_ref()
+                                .filter(|n| n.clearable && !r.dismissed)
+                                .map(|_| k.clone())
+                        })
+                        .collect();
+                    for key in keys {
+                        if let Some(record) = state.records.get_mut(&key) {
+                            let mut sent = false;
+                            if let (Some(note), Some(p)) = (record.note.as_ref(), peer.as_ref()) {
+                                if p.command(note, None).await.is_ok() {
+                                    sent = true;
+                                } else {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
+                            if sent {
+                                count = count.saturating_add(1);
+                                if let Some(id) = record.id.take() {
+                                    desktop.close(id).await;
+                                }
+                                record.last_id = None;
+                                record.hidden = true;
+                                record.dismissed = true;
+                            }
+                        }
+                    }
+                    if disconnected {
+                        peer = None;
+                        publish_panel_state(
+                            &panel_snapshot,
+                            panel_iface.as_ref(),
+                            &state,
+                            false,
+                            desktop_forwarding,
+                        )
+                        .await;
+                    } else if count > 0 {
+                        let _ = state.save(state_path);
+                        publish_panel_state(
+                            &panel_snapshot,
+                            panel_iface.as_ref(),
+                            &state,
+                            peer.is_some(),
+                            desktop_forwarding,
+                        )
+                        .await;
+                    }
+                    let _ = reply.send(count).await;
+                }
+                PanelCommand::SetDesktopForwarding { enabled, reply } => {
+                    if desktop_forwarding != enabled {
+                        desktop_forwarding = enabled;
+                        if !desktop_forwarding {
+                            for record in state.records.values_mut() {
+                                if let Some(id) = record.id.take() {
+                                    desktop.close(id).await;
+                                }
+                            }
+                        } else {
+                            for record in state.records.values_mut() {
+                                record.hidden = false;
+                            }
+                            let snapshot = state
+                                .records
+                                .iter()
+                                .filter_map(|(k, r)| r.note.clone().map(|n| (k.clone(), n)))
+                                .collect();
+                            let _ =
+                                reconcile(&mut state, snapshot, &desktop, desktop_forwarding).await;
+                        }
+                        let _ = state.save(state_path);
+                        publish_panel_state(
+                            &panel_snapshot,
+                            panel_iface.as_ref(),
+                            &state,
+                            peer.is_some(),
+                            desktop_forwarding,
+                        )
+                        .await;
+                    }
+                    let _ = reply.send(desktop_forwarding).await;
+                }
+            },
+            Event::Owner(_) | Event::Signal(_) | Event::Panel(None) => {
+                return Err("session bus closed".into());
+            }
         }
     }
 }

@@ -21,6 +21,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="打开设置中心时默认定位的页面",
     )
     parser.add_argument(
+        "--package",
+        default=None,
+        help="打开应用页时自动定位并选中的 Android 包名",
+    )
+    parser.add_argument(
         "--install-apk",
         nargs="+",
         metavar="APK",
@@ -31,6 +36,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="运行宿主机物理重力感应与 Android 方向同步守护进程",
     )
+    parser.add_argument(
+        "--panel-daemon",
+        action="store_true",
+        help="运行 Plasma 控制中心 D-Bus 后端服务 (org.droidloom.ControlCenter)",
+    )
     return parser.parse_args(argv)
 
 
@@ -38,6 +48,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.orientation_daemon:
         return run_orientation_daemon()
+    if args.panel_daemon:
+        from .backend.panel_daemon import run_panel_daemon
+
+        return run_panel_daemon()
 
     from PySide6 import QtWidgets
     from .ui.apk_install_dialog import ApkInstallDialog
@@ -70,7 +84,7 @@ def main(argv: list[str] | None = None) -> int:
         dlg.show()
         return app.exec()
 
-    win = MainWindow(initial_page=args.page)
+    win = MainWindow(initial_page=args.page, initial_package=args.package)
     win.show()
     return app.exec()
 

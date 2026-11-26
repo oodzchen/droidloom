@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.droidloom.ControlCenter
+Exec=@PANEL_DAEMON_EXEC@
+SystemdService=droidloom-panel.service

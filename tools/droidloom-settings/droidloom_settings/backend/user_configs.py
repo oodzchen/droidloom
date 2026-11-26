@@ -427,3 +427,43 @@ def set_desktop_launch_resolution(
         new_lines.append(f"X-Droidloom-Resolution={resolution}")
     atomic_write_text(path, "\n".join(new_lines) + "\n", mode=0o600)
     return True
+
+
+@dataclass
+class PanelConfig:
+    desktop_forwarding: bool = True
+    default_tab: str = "control"
+    show_system_tasks: bool = False
+
+
+def load_panel_config(config_dir: Path | None = None) -> PanelConfig:
+    path = (config_dir or xdg_config_dir()) / "panel-v1.json"
+    if not path.is_file():
+        return PanelConfig()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return PanelConfig()
+    tab = str(raw.get("default_tab", "control"))
+    if tab not in ("control", "tasks", "apps"):
+        tab = "control"
+    return PanelConfig(
+        desktop_forwarding=bool(raw.get("desktop_forwarding", True)),
+        default_tab=tab,
+        show_system_tasks=bool(raw.get("show_system_tasks", False)),
+    )
+
+
+def save_panel_config(cfg: PanelConfig, config_dir: Path | None = None) -> None:
+    tab = cfg.default_tab if cfg.default_tab in ("control", "tasks", "apps") else "control"
+    path = (config_dir or xdg_config_dir()) / "panel-v1.json"
+    atomic_write_json(
+        path,
+        {
+            "schema": 1,
+            "desktop_forwarding": bool(cfg.desktop_forwarding),
+            "default_tab": tab,
+            "show_system_tasks": bool(cfg.show_system_tasks),
+        },
+        mode=0o644,
+    )

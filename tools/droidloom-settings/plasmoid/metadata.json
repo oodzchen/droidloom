@@ -1,0 +1,23 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Droidloom"
+            }
+        ],
+        "Category": "System Information",
+        "Description": "管理 Droidloom Android 实时通知、快捷开关、后台任务与应用列表",
+        "EnabledByDefault": true,
+        "Icon": "org.droidloom.Settings",
+        "Id": "org.droidloom.ControlCenter",
+        "License": "GPL-3.0-or-later",
+        "Name": "Droidloom 控制中心",
+        "ServiceTypes": [
+            "Plasma/Applet"
+        ],
+        "Version": "1.0"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-MainScript": "ui/main.qml"
+}

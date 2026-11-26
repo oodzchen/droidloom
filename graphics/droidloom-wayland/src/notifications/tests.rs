@@ -558,3 +558,188 @@ fn launcher_activity_names_the_droidloom_desktop_entry_and_groups_cross() {
     assert!(hints.contains_key("x-denial-messages"));
     assert!(!bool::try_from(hints.get("x-denial-clearable").unwrap()).unwrap());
 }
+
+#[derive(Debug, zbus::DBusError)]
+#[zbus(prefix = "org.freedesktop.Notifications.Error")]
+enum NotifyError {
+    #[zbus(error)]
+    ZBus(zbus::Error),
+    ExcessNotificationGeneration(String),
+}
+
+struct RateLimitedServer {
+    next: Arc<AtomicU32>,
+    reject: Arc<std::sync::atomic::AtomicBool>,
+    events: async_channel::Sender<Observed>,
+}
+#[zbus::interface(name = "org.freedesktop.Notifications")]
+impl RateLimitedServer {
+    fn get_capabilities(&self) -> Vec<&str> {
+        vec!["actions", "body", "body-markup", "icon-static"]
+    }
+    async fn notify(
+        &self,
+        _app: &str,
+        replaces: u32,
+        _icon: &str,
+        _title: &str,
+        body: &str,
+        actions: Vec<String>,
+        hints: HashMap<String, OwnedValue>,
+        expire_timeout: i32,
+    ) -> std::result::Result<u32, NotifyError> {
+        if self.reject.load(Ordering::SeqCst) {
+            return Err(NotifyError::ExcessNotificationGeneration(
+                "Created too many similar notifications in quick succession".into(),
+            ));
+        }
+        let id = if replaces != 0 {
+            replaces
+        } else {
+            self.next.fetch_add(1, Ordering::SeqCst)
+        };
+        self.events
+            .send(Observed::Posted(
+                id,
+                replaces,
+                body.to_string(),
+                actions,
+                hints,
+                expire_timeout,
+            ))
+            .await
+            .unwrap();
+        Ok(id)
+    }
+    async fn close_notification(&self, id: u32) {
+        self.events.send(Observed::Closed(id)).await.unwrap();
+    }
+}
+
+#[test]
+fn actions_survive_rate_limit_and_popup_expiry_and_dedup_unchanged_posts() {
+    let mut child = Command::new("dbus-daemon")
+        .args(["--session", "--nofork", "--print-address=1"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut address = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut address)
+        .unwrap();
+    let _bus = Bus(child);
+    future::block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notification.sock");
+        let listener = Async::new(UnixListener::bind(&path).unwrap()).unwrap();
+        let (tx, rx) = async_channel::bounded(128);
+        let reject = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .name(NAME)
+            .unwrap()
+            .serve_at(
+                PATH,
+                RateLimitedServer {
+                    next: Arc::new(AtomicU32::new(300)),
+                    reject: reject.clone(),
+                    events: tx,
+                },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let conn = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let state = dir.path().join("state");
+        let grants = HostGrants::default();
+        let bridge = serve(&listener, &state, conn, unsafe { libc::getuid() }, &grants);
+        let checks = async {
+            let socket = Async::<UnixStream>::connect(&path).await.unwrap();
+            frame(&socket, serde_json::json!({"type":"hello","abi":3})).await;
+            assert_eq!(
+                reply(&socket).await,
+                serde_json::json!({"type":"hello","abi":3})
+            );
+            let mut media = note("v1");
+            media.alert = false;
+            media.ongoing = true;
+            media.clearable = false;
+            snapshot(&socket, &[media.clone()]).await;
+            assert!(matches!(
+                timeout(rx.recv()).await.unwrap(),
+                Observed::Posted(300, 0, ..)
+            ));
+            // Identical non-alerting update skips redundant Notify while updating version.
+            media.version = "v2".into();
+            media.when += 1000;
+            frame(
+                &socket,
+                serde_json::json!({"type":"post","notification":media}),
+            )
+            .await;
+            quiet(&rx).await;
+            // Rate-limited update must preserve desktop ID 300 so buttons keep working.
+            reject.store(true, Ordering::SeqCst);
+            media.version = "v3".into();
+            media.title = "Next Track".into();
+            frame(
+                &socket,
+                serde_json::json!({"type":"post","notification":media}),
+            )
+            .await;
+            quiet(&rx).await;
+            server
+                .emit_signal(
+                    None::<&str>,
+                    PATH,
+                    NAME,
+                    "ActionInvoked",
+                    &(300u32, "action-0"),
+                )
+                .await
+                .unwrap();
+            let action = reply(&socket).await;
+            assert_eq!(action["type"], "action");
+            assert_eq!(action["version"], "v3");
+            assert_eq!(action["action"], "action-0");
+            // Popup expiry (reason=1) keeps last_id so history actions still work.
+            server
+                .emit_signal(
+                    None::<&str>,
+                    PATH,
+                    NAME,
+                    "NotificationClosed",
+                    &(300u32, 1u32),
+                )
+                .await
+                .unwrap();
+            server
+                .emit_signal(
+                    None::<&str>,
+                    PATH,
+                    NAME,
+                    "ActionInvoked",
+                    &(300u32, "action-0"),
+                )
+                .await
+                .unwrap();
+            let history_action = reply(&socket).await;
+            assert_eq!(history_action["type"], "action");
+            assert_eq!(history_action["version"], "v3");
+            assert_eq!(history_action["action"], "action-0");
+        };
+        future::race(
+            async {
+                bridge.await.unwrap();
+                panic!("bridge stopped")
+            },
+            checks,
+        )
+        .await;
+    });
+}

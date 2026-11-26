@@ -302,9 +302,14 @@ impl Peer {
         .await
     }
 }
+const EXCESS_NOTIFICATION_GENERATION: &str =
+    "org.freedesktop.Notifications.Error.ExcessNotificationGeneration";
+
 #[derive(Default, Serialize, Deserialize)]
 struct Record {
     id: Option<u32>,
+    #[serde(default)]
+    last_id: Option<u32>,
     version: String,
     hidden: bool,
     #[serde(skip)]
@@ -336,6 +341,7 @@ impl State {
             self.owner = owner;
             for record in self.records.values_mut() {
                 record.id = None;
+                record.last_id = None;
                 record.hidden = false;
             }
         }
@@ -475,6 +481,25 @@ async fn reconcile(
     }
     Ok(())
 }
+fn same_presentation(a: &Note, b: &Note) -> bool {
+    a.package == b.package
+        && a.app == b.app
+        && a.title == b.title
+        && a.body == b.body
+        && a.actions == b.actions
+        && a.urgency == b.urgency
+        && a.ongoing == b.ongoing
+        && a.clearable == b.clearable
+        && a.icon == b.icon
+        && a.group == b.group
+        && a.summary == b.summary
+        && a.progress == b.progress
+        && a.category == b.category
+        && a.user == b.user
+        && a.component == b.component
+        && a.large_icon == b.large_icon
+        && a.messages == b.messages
+}
 async fn upsert(
     state: &mut State,
     key: String,
@@ -487,22 +512,51 @@ async fn upsert(
         record.hidden = false;
     }
     let changed = record.version != note.version;
+    let unchanged_presentation = record.id.is_some()
+        && !quiet
+        && !note.alert
+        && record
+            .note
+            .as_ref()
+            .is_some_and(|prev| same_presentation(prev, &note));
     record.version = note.version.clone();
     record.note = Some(note.clone());
-    if !state.owner.is_empty() && !record.hidden && (changed || record.id.is_none()) {
+    if !state.owner.is_empty()
+        && !record.hidden
+        && !unchanged_presentation
+        && (changed || record.id.is_none())
+    {
         let replaces = record.id.unwrap_or(0);
         match desktop.notify(&note, replaces, quiet).await {
-            Ok(id) => record.id = Some(id),
+            Ok(id) => {
+                record.id = Some(id);
+                record.last_id = None;
+            }
+            Err(zbus::Error::MethodError(name, msg, _))
+                if name.as_str() == EXCESS_NOTIFICATION_GENERATION =>
+            {
+                // Preserve existing desktop ID mapping so action buttons on the
+                // currently displayed notification remain functional.
+                eprintln!(
+                    "Droidloom notifications: desktop Notify rate-limited ({name}: {})",
+                    msg.as_deref().unwrap_or("")
+                );
+            }
             Err(zbus::Error::MethodError(name, msg, _)) => {
                 if replaces != 0 {
                     match desktop.notify(&note, 0, quiet).await {
-                        Ok(id) => record.id = Some(id),
+                        Ok(id) => {
+                            record.id = Some(id);
+                            record.last_id = None;
+                        }
                         Err(zbus::Error::MethodError(retry_name, retry_msg, _)) => {
                             eprintln!(
                                 "Droidloom notifications: desktop Notify rejected ({retry_name}: {})",
                                 retry_msg.as_deref().unwrap_or("")
                             );
-                            record.id = None;
+                            if retry_name.as_str() != EXCESS_NOTIFICATION_GENERATION {
+                                record.id = None;
+                            }
                         }
                         Err(error) => return Err(error.into()),
                     }
@@ -723,7 +777,7 @@ async fn serve(
                         if let Some(note) = state
                             .records
                             .values()
-                            .find(|r| r.id == Some(id))
+                            .find(|r| r.id == Some(id) || r.last_id == Some(id))
                             .and_then(|r| r.note.as_ref())
                         {
                             if note.actions.iter().any(|a| a.key == action) {
@@ -740,9 +794,15 @@ async fn serve(
                     }
                     Some("NotificationClosed") => {
                         let (id, reason): (u32, u32) = message.body().deserialize()?;
-                        if let Some(record) = state.records.values_mut().find(|r| r.id == Some(id))
+                        if let Some(record) = state
+                            .records
+                            .values_mut()
+                            .find(|r| r.id == Some(id) || r.last_id == Some(id))
                         {
                             record.id = None;
+                            // Keep the expired desktop ID so action buttons clicked from
+                            // Plasma's notification history still resolve to this record.
+                            record.last_id = (reason == 1).then_some(id);
                             record.hidden = true;
                             if reason == 2 {
                                 if let (Some(note), Some(p)) = (&record.note, &peer) {

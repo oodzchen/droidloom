@@ -713,6 +713,18 @@ def _proc_state_label(state: int | None) -> str:
     return "驻留"
 
 
+def _normalize_component(raw: str) -> tuple[str, str]:
+    text = raw.strip()
+    if "/" not in text:
+        return "", ""
+    pkg, cls = text.split("/", 1)
+    if not pkg or not cls:
+        return "", ""
+    if cls.startswith("."):
+        cls = f"{pkg}{cls}"
+    return pkg, f"{pkg}/{cls}"
+
+
 def parse_running_tasks_and_services(
     raw_text: str, include_system: bool = False
 ) -> dict[str, Any]:
@@ -816,6 +828,33 @@ def parse_running_tasks_and_services(
     seen_task_pkgs: set[str] = set()
     cur_task: dict[str, Any] | None = None
     in_recent_tasks = False
+
+    def flush_task() -> None:
+        nonlocal cur_task
+        if cur_task is None:
+            return
+        affinity = str(cur_task.pop("_affinity", ""))
+        orig_comp = str(cur_task.pop("_orig_comp", ""))
+        intent_comp = str(cur_task.pop("_intent_comp", ""))
+        activity_comp = str(cur_task.pop("_activity_comp", ""))
+        pkg = ""
+        norm_comp = ""
+        for raw_comp in (orig_comp, intent_comp, activity_comp):
+            p, c = _normalize_component(raw_comp)
+            if p:
+                pkg, norm_comp = p, c
+                break
+        if not pkg:
+            pkg = affinity
+        if pkg:
+            cur_task["package"] = pkg
+            cur_task["component"] = norm_comp
+            cur_task["visible"] = (pkg in visible_pkgs) or (
+                bool(affinity) and affinity in visible_pkgs
+            )
+            tasks.append(cur_task)
+        cur_task = None
+
     for line in sections.get("===RECENTS===", []):
         s = line.strip()
         if s.startswith("Recent tasks:"):
@@ -826,34 +865,39 @@ def parse_running_tasks_and_services(
         if not in_recent_tasks:
             continue
         if s.startswith("* Recent #"):
-            if cur_task and cur_task.get("package"):
-                tasks.append(cur_task)
+            flush_task()
             m_id = re.search(r"#(\d+)\s+type=(\S+)", s)
             m_aff = re.search(r"A=\d+:([^\s\}]+)", s)
-            pkg = m_aff.group(1) if m_aff else ""
+            affinity = m_aff.group(1) if m_aff else ""
             cur_task = {
                 "task_id": int(m_id.group(1)) if m_id else 0,
                 "type": m_id.group(2) if m_id else "standard",
-                "package": pkg,
+                "package": "",
                 "component": "",
                 "has_activities": True,
-                "visible": pkg in visible_pkgs,
+                "visible": False,
                 "last_active_ms": 0,
+                "_affinity": affinity,
+                "_orig_comp": "",
+                "_intent_comp": "",
+                "_activity_comp": "",
             }
         elif cur_task is not None:
-            if s.startswith("mActivityComponent="):
-                comp = s.split("=", 1)[1].strip()
-                cur_task["component"] = comp
-                if "/" in comp and not cur_task["package"]:
-                    cur_task["package"] = comp.split("/", 1)[0]
+            if s.startswith("origActivity="):
+                cur_task["_orig_comp"] = s.split("=", 1)[1].strip()
+            elif s.startswith("mActivityComponent="):
+                cur_task["_activity_comp"] = s.split("=", 1)[1].strip()
+            elif s.startswith("intent="):
+                m_cmp = re.search(r"cmp=([^\s\}]+)", s)
+                if m_cmp:
+                    cur_task["_intent_comp"] = m_cmp.group(1)
             elif s.startswith("Activities=[]"):
                 cur_task["has_activities"] = False
             elif s.startswith("lastActiveTime="):
                 m_t = re.search(r"lastActiveTime=(\d+)", s)
                 if m_t:
                     cur_task["last_active_ms"] = int(m_t.group(1))
-    if cur_task and cur_task.get("package"):
-        tasks.append(cur_task)
+    flush_task()
 
     filtered_tasks: list[dict[str, Any]] = []
     for t in tasks:

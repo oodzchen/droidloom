@@ -440,7 +440,7 @@ class PanelController:
         for task in data.get("recent_tasks") or []:
             name, comp, icon_path = self._app_label_and_icon(task["package"])
             task["name"] = name
-            if not task.get("component"):
+            if comp:
                 task["component"] = comp
             task["icon_path"] = icon_path
         for app in data.get("background_apps") or []:

@@ -56,7 +56,7 @@ ColumnLayout {
             checked: Boolean(Plasmoid.configuration.showNotificationBadge)
             icon.name: "tag-symbolic"
             text: "角标"
-            display: AbstractButton.TextBesideIcon
+            display: PlasmaComponents3.AbstractButton.TextBesideIcon
             onClicked: Plasmoid.configuration.showNotificationBadge = !Plasmoid.configuration.showNotificationBadge
             PlasmaComponents3.ToolTip.text: "在面板图标上显示/隐藏未读通知数量角标"
             PlasmaComponents3.ToolTip.visible: hovered
@@ -67,7 +67,7 @@ ColumnLayout {
             checked: Boolean(root.runtimeState.desktop_forwarding)
             icon.name: checked ? "notifications" : "notifications-disabled"
             text: "同步弹窗"
-            display: AbstractButton.TextBesideIcon
+            display: PlasmaComponents3.AbstractButton.TextBesideIcon
             onClicked: root.setQuickToggle("desktop_forwarding", !root.runtimeState.desktop_forwarding)
             PlasmaComponents3.ToolTip.text: "开启时 Android 通知同时推送到 Plasma 全局通知"
             PlasmaComponents3.ToolTip.visible: hovered

@@ -342,7 +342,7 @@ ColumnLayout {
             visible: !qsRoot.editMode && qsRoot.activeKeys.length > 4
             icon.name: Plasmoid.configuration.quickTilesExpanded ? "go-up" : "go-down"
             text: Plasmoid.configuration.quickTilesExpanded ? "收起" : ("展开 (" + qsRoot.activeKeys.length + ")")
-            display: AbstractButton.TextBesideIcon
+            display: PlasmaComponents3.AbstractButton.TextBesideIcon
             onClicked: Plasmoid.configuration.quickTilesExpanded = !Plasmoid.configuration.quickTilesExpanded
         }
 
@@ -350,7 +350,7 @@ ColumnLayout {
             visible: !qsRoot.editMode
             icon.name: "document-edit"
             text: "编辑"
-            display: AbstractButton.TextBesideIcon
+            display: PlasmaComponents3.AbstractButton.TextBesideIcon
             onClicked: qsRoot.editMode = true
         }
 
@@ -358,7 +358,7 @@ ColumnLayout {
             visible: qsRoot.editMode
             icon.name: "edit-undo"
             text: "重置"
-            display: AbstractButton.TextBesideIcon
+            display: PlasmaComponents3.AbstractButton.TextBesideIcon
             onClicked: root.resetQuickTiles()
         }
 
@@ -366,7 +366,7 @@ ColumnLayout {
             visible: qsRoot.editMode
             icon.name: "dialog-ok-apply"
             text: "完成"
-            display: AbstractButton.TextBesideIcon
+            display: PlasmaComponents3.AbstractButton.TextBesideIcon
             onClicked: qsRoot.editMode = false
         }
     }
@@ -623,7 +623,7 @@ ColumnLayout {
                             PlasmaComponents3.ToolButton {
                                 icon.name: "list-add"
                                 text: "添加"
-                                display: AbstractButton.TextBesideIcon
+                                display: PlasmaComponents3.AbstractButton.TextBesideIcon
                                 onClicked: root.addQuickTile(modelData)
                             }
                         }

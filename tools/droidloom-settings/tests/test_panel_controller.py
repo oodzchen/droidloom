@@ -322,6 +322,88 @@ class PanelControllerTests(unittest.TestCase):
                 self.assertTrue(ok_s)
                 mock_stay.assert_called_once_with(True, selector="device:droidloom")
 
+    def test_parse_recent_task_uses_real_package_not_task_affinity(self) -> None:
+        raw_settings_affinity = """
+===USER_PKGS===
+===RECENTS===
+ACTIVITY MANAGER RECENT TASKS (dumpsys activity recents)
+  Recent tasks:
+  * Recent #0: Task{aeee4fa #24 type=standard A=1000:com.android.settings.root}
+    intent={act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] flg=0x10000000 cmp=com.android.settings/.Settings}
+    origActivity=com.android.settings/.Settings
+    mActivityComponent=com.android.settings/.homepage.SettingsHomepageActivity
+    Activities=[]
+    lastActiveTime=748486239 (inactive for 714s)
+  Visible recent tasks (most recent first):
+===ACTIVITIES===
+  Task{aeee4fa #24 type=standard A=1000:com.android.settings.root U=0 visible=true}
+===SERVICES===
+===PROCS===
+===PS===
+"""
+        res = parse_running_tasks_and_services(raw_settings_affinity, include_system=False)
+        self.assertEqual(len(res["recent_tasks"]), 1)
+        task = res["recent_tasks"][0]
+        self.assertEqual(task["package"], "com.android.settings")
+        self.assertEqual(task["component"], "com.android.settings/com.android.settings.Settings")
+        self.assertTrue(task["visible"])
+
+        raw_pkg_visible = raw_settings_affinity.replace(
+            "Task{aeee4fa #24 type=standard A=1000:com.android.settings.root U=0 visible=true}",
+            "topResumedActivity=ActivityRecord{123 u0 com.android.settings/.Settings t24}",
+        )
+        res2 = parse_running_tasks_and_services(raw_pkg_visible, include_system=False)
+        self.assertTrue(res2["recent_tasks"][0]["visible"])
+
+    def test_get_tasks_prefers_catalog_launcher_component(self) -> None:
+        class _SettingsFakeClient(_FakeClient):
+            def list_applications(self):
+                return [
+                    {
+                        "name": "Settings",
+                        "package": "com.android.settings",
+                        "component": "com.android.settings/com.android.settings.Settings",
+                    }
+                ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            ctrl = PanelController(
+                client=_SettingsFakeClient(),
+                cache_dir=t / "cache",
+                config_dir=t / "cfg",
+                apps_dir=t / "apps",
+            )
+            stub_tasks = {
+                "connected": True,
+                "recent_tasks": [
+                    {
+                        "task_id": 24,
+                        "type": "standard",
+                        "package": "com.android.settings",
+                        "component": "com.android.settings/com.android.settings.homepage.SettingsHomepageActivity",
+                        "has_activities": False,
+                        "visible": False,
+                        "last_active_ms": 748486239,
+                        "rss_kb": 0,
+                        "process_count": 0,
+                        "foreground_service": False,
+                        "running": False,
+                    }
+                ],
+                "background_apps": [],
+            }
+            with mock.patch(
+                "droidloom_settings.backend.panel_controller.query_running_tasks_and_services",
+                return_value=stub_tasks,
+            ):
+                res = ctrl.get_tasks(include_system=False)
+            self.assertEqual(len(res["recent_tasks"]), 1)
+            task = res["recent_tasks"][0]
+            self.assertEqual(task["name"], "Settings")
+            self.assertEqual(task["component"], "com.android.settings/com.android.settings.Settings")
+            self.assertTrue(task["icon_path"].startswith("file://"))
+
 
 if __name__ == "__main__":
     unittest.main()

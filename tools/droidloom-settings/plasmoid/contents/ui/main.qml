@@ -438,7 +438,7 @@ PlasmoidItem {
     }
 
     onExpandedChanged: {
-        if (expanded) {
+        if (root.expanded) {
             refreshAll()
         }
     }

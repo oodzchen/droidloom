@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -51,6 +52,11 @@ class PlasmoidQmlTests(unittest.TestCase):
                 comp.status(),
                 QQmlComponent.Status.Ready,
                 f"{qml_path.name} not Ready: {[e.toString() for e in comp.errors()]}",
+            )
+            text = qml_path.read_text(encoding="utf-8")
+            self.assertIsNone(
+                re.search(r"(?<![A-Za-z0-9_.])AbstractButton\.", text),
+                f"{qml_path.name} contains unqualified AbstractButton reference",
             )
 
 

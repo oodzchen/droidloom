@@ -8,6 +8,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
+from .mpris_bridge import AndroidMprisBridgeManager
 from .panel_controller import PanelController
 from .user_configs import load_panel_config
 
@@ -284,6 +285,8 @@ class ControlCenterService:
         connection: Any,
         controller: PanelController | None = None,
         pool: ThreadPoolExecutor | None = None,
+        mpris_manager: Any | None = None,
+        enable_mpris: bool = True,
     ) -> None:
         from gi.repository import Gio, GLib
 
@@ -295,6 +298,13 @@ class ControlCenterService:
             self.controller.notif_bridge = NotificationDBusBridge(
                 connection, self._on_notifications_pushed
             )
+        if mpris_manager is not None:
+            self._mpris_manager: Any | None = mpris_manager
+        elif enable_mpris:
+            self._mpris_manager = AndroidMprisBridgeManager(controller=self.controller)
+            self._mpris_manager.start()
+        else:
+            self._mpris_manager = None
         self._node_info = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION_XML)
         self._reg_id = connection.register_object(
             OBJECT_PATH,
@@ -306,6 +316,8 @@ class ControlCenterService:
         self._GLib = GLib
 
     def close(self) -> None:
+        if self._mpris_manager is not None:
+            self._mpris_manager.close()
         if self._reg_id:
             self.connection.unregister_object(self._reg_id)
             self._reg_id = 0

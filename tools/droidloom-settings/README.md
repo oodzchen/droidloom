@@ -32,6 +32,8 @@ PySide6 (Qt 6) desktop control center, graphical APK installer, `.apk` MIME hand
   - **Live Notifications**: Consumes `org.droidloom.Notifications` exported by `droidloom-wayland` (with automatic ADB fallback) to display ongoing + normal notifications, progress bars, MessagingStyle lines, action buttons, and a desktop popup forwarding toggle.
   - **Running Tasks & Background Services**: Inspect active/recent tasks and foreground/background services with RSS memory usage, switch/launch, force-stop, and batch background cleanup.
   - **All Apps Drawer**: Searchable grid with cached icons, quick launch, force-stop, and deep-linking into `droidloom-settings --page apps --package <pkg>`.
+- **Native KDE Plasma MPRIS 2 Media Integration (`org.mpris.MediaPlayer2.droidloom.*`)**:
+  - `droidloom-panel.service` bridges active Android `MediaSession` players (via `droidloom-media-bridge.dex` / `app_process`, with `dumpsys media_session` fallback) to per-app MPRIS 2 D-Bus objects so Android music/media apps appear directly in KDE Plasma's native Media Player widget, lock screen, and hardware media keys (album art, live seekable progress, play/pause/stop/next/prev, rate, volume, repeat/shuffle).
 
 ## User Installation
 

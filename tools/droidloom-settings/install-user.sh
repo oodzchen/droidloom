@@ -61,6 +61,14 @@ exec /usr/bin/python3 -B -m droidloom_settings.main --panel-daemon "\$@"
 EOF
 chmod 0755 "$PANEL_DAEMON_BIN"
 
+# Build Android MediaSession DEX bridge (used by droidloom-panel-daemon for Plasma MPRIS2 integration)
+MEDIA_DEX_OUT="$APP_SHARE/assets/droidloom-media-bridge.dex"
+if /usr/bin/python3 "$SCRIPT_DIR/scripts/build_media_bridge.py" --output "$MEDIA_DEX_OUT"; then
+  media_bridge_status="$MEDIA_DEX_OUT"
+else
+  media_bridge_status="unavailable (using dumpsys fallback)"
+fi
+
 if [ ! -f "$HICOLOR_DIR/index.theme" ] && [ -f /usr/share/icons/hicolor/index.theme ]; then
   install -m 0644 /usr/share/icons/hicolor/index.theme "$HICOLOR_DIR/index.theme"
 fi
@@ -175,6 +183,7 @@ mime_icon_line="$(grep -m1 "^${APK_MIME}:" "$MIME_DIR/icons" 2>/dev/null || echo
 echo "Installed Droidloom Settings to $SETTINGS_BIN"
 echo "Installed Droidloom APK Installer to $INSTALLER_BIN"
 echo "Installed Droidloom Panel D-Bus Daemon to $PANEL_DAEMON_BIN"
+echo "Installed Android MPRIS2 Media Bridge: ${media_bridge_status:-unavailable}"
 echo "Installed Plasma 6 Widget ($PLASMOID_ID) to $PLASMOID_DIR/$PLASMOID_ID"
 echo "Default APK handler: $(xdg-mime query default "$APK_MIME" 2>/dev/null || echo unknown)"
 echo "APK MIME icon: $mime_icon_line"

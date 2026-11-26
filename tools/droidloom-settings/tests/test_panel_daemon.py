@@ -85,7 +85,7 @@ class PanelDaemonTests(unittest.TestCase):
                     None,
                 )
 
-                svc = ControlCenterService(server_conn, controller=ctrl)
+                svc = ControlCenterService(server_conn, controller=ctrl, enable_mpris=False)
                 try:
                     loop = GLib.MainLoop()
                     results: dict[str, object] = {}

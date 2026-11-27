@@ -10,6 +10,7 @@
 - [Native application integration proposal](native-app-integration.md): system-service backends and ordinary Linux application behavior.
 - [Audio bridge and remaining work](audio-integration-proposal.md).
 - [Security requirements](threat-model-v2.md): trust boundaries and isolation limitations.
+- [Host isolation and desktop boundaries](host-isolation.md): host-conflict audit, phased hardening, and trade-offs.
 
 ## Integration contracts
 

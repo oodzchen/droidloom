@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -78,6 +81,43 @@ MPRIS_INTROSPECTION_XML = """
 
 _MAX_ART_DOWNLOAD_BYTES = 2 * 1024 * 1024
 _MAX_ART_CACHE_FILES = 60
+
+
+def _is_safe_remote_art_url(url: str) -> bool:
+    """Allow only public HTTP(S) URLs, blocking loopback/private/link-local SSRF targets."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    host = parsed.hostname
+    try:
+        ip_obj = ipaddress.ip_address(host)
+        return ip_obj.is_global
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        addr = info[4][0].split("%", 1)[0]
+        try:
+            if not ipaddress.ip_address(addr).is_global:
+                return False
+        except ValueError:
+            return False
+    return True
+
+
+class _NoUnsafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _is_safe_remote_art_url(newurl):
+            raise urllib.error.URLError("blocked unsafe artwork redirect")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def sanitize_bus_segment(package: str) -> str:
@@ -177,7 +217,9 @@ class MediaArtCache:
         return self.store_bytes(art_hash, raw)
 
     def fetch_remote_async(self, url: str, on_ready: Callable[[str, str], None]) -> None:
-        if not url or not (url.startswith("http://") or url.startswith("https://")):
+        if os.environ.get("DROIDLOOM_MPRIS_FETCH_REMOTE_ART") != "1":
+            return
+        if not _is_safe_remote_art_url(url):
             return
         cached = self.lookup(f"url:{url}")
         if cached:
@@ -191,11 +233,12 @@ class MediaArtCache:
         def worker() -> None:
             uri_out = ""
             try:
+                opener = urllib.request.build_opener(_NoUnsafeRedirectHandler)
                 req = urllib.request.Request(
                     url,
                     headers={"User-Agent": "Droidloom-MPRIS/1.0"},
                 )
-                with urllib.request.urlopen(req, timeout=4.0) as resp:
+                with opener.open(req, timeout=4.0) as resp:
                     data = resp.read(_MAX_ART_DOWNLOAD_BYTES + 1)
                     if 0 < len(data) <= _MAX_ART_DOWNLOAD_BYTES:
                         uri_out = self.store_bytes(f"url:{url}", data)
@@ -627,7 +670,8 @@ class MprisPlayerInstance:
         st.track_number = track_number
         st.media_id = media_id
 
-        # Art resolution: prefer inline PNG base64, then cached hash, then async remote URI.
+        # Art resolution: accept inline PNG base64 or cached hash; never expose raw
+        # Android file:// paths, and only fetch remote HTTP(S) URIs when opted in.
         art_hash = str(data.get("art_hash") or "")
         art_b64 = str(data.get("art_png_b64") or "")
         art_uri = str(data.get("art_uri") or "")
@@ -637,18 +681,19 @@ class MprisPlayerInstance:
             cached = self._art_cache.lookup(art_hash)
             if cached:
                 st.art_url = cached
-        elif art_uri:
-            if art_uri.startswith("file://"):
-                st.art_url = art_uri
+        elif (
+            art_uri
+            and os.environ.get("DROIDLOOM_MPRIS_FETCH_REMOTE_ART") == "1"
+            and _is_safe_remote_art_url(art_uri)
+        ):
+            cached_remote = self._art_cache.lookup(f"url:{art_uri}")
+            if cached_remote:
+                st.art_url = cached_remote
             else:
-                cached_remote = self._art_cache.lookup(f"url:{art_uri}")
-                if cached_remote:
-                    st.art_url = cached_remote
-                else:
-                    def _on_art(_url: str, local_uri: str) -> None:
-                        self._GLib.idle_add(self._apply_async_art, local_uri)
+                def _on_art(_url: str, local_uri: str) -> None:
+                    self._GLib.idle_add(self._apply_async_art, local_uri)
 
-                    self._art_cache.fetch_remote_async(art_uri, _on_art)
+                self._art_cache.fetch_remote_async(art_uri, _on_art)
         else:
             st.art_url = ""
 

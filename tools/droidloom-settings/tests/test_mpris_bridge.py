@@ -22,6 +22,7 @@ from droidloom_settings.backend.mpris_bridge import (
     MPRIS_OBJECT_PATH,
     MediaArtCache,
     MprisPlayerInstance,
+    _is_safe_remote_art_url,
     parse_dumpsys_media_session,
     sanitize_bus_segment,
 )
@@ -334,6 +335,20 @@ class MprisBridgeTests(unittest.TestCase):
         finally:
             proc.terminate()
             proc.wait(timeout=5)
+
+    def test_art_uri_rejects_local_files_and_private_ssrf_targets(self) -> None:
+        self.assertFalse(_is_safe_remote_art_url("file:///etc/passwd"))
+        self.assertFalse(_is_safe_remote_art_url("http://127.0.0.1:8080/secret.png"))
+        self.assertFalse(_is_safe_remote_art_url("http://10.177.0.2/internal.png"))
+        self.assertFalse(_is_safe_remote_art_url("http://169.254.169.254/latest/meta-data"))
+        self.assertFalse(_is_safe_remote_art_url("http://[::1]/loopback.png"))
+        self.assertTrue(_is_safe_remote_art_url("https://93.184.216.34/cover.png"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = MediaArtCache(cache_dir=Path(tmp))
+            called: list[str] = []
+            cache.fetch_remote_async("https://93.184.216.34/cover.png", lambda u, _l: called.append(u))
+            self.assertEqual(called, [])
 
 
 if __name__ == "__main__":

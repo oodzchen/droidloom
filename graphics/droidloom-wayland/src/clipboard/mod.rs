@@ -29,6 +29,70 @@ const MARKER: &str = "application/x-droidloom-clipboard-";
 const TEXT: &str = "text/plain;charset=utf-8";
 const URI: &str = "text/uri-list";
 const GNOME: &str = "x-special/gnome-copied-files";
+const KDE_PASSWORD_HINT: &str = "x-kde-passwordManagerHint";
+const QT_EXCLUDE_HISTORY_HINT: &str =
+    "application/x-qt-windows-mime;value=\"ExcludeClipboardContentFromMonitorProcessing\"";
+
+fn is_sensitive_offer(mimes: &[String], allow_secrets: bool) -> bool {
+    if allow_secrets {
+        return false;
+    }
+    mimes
+        .iter()
+        .any(|m| m == KDE_PASSWORD_HINT || m == QT_EXCLUDE_HISTORY_HINT)
+}
+
+fn resolve_lazy_sync(sync_env: Option<&str>, mode_env: Option<&str>) -> bool {
+    match sync_env {
+        Some("focus") => true,
+        Some("eager") => false,
+        _ => matches!(mode_env, Some("desktop")),
+    }
+}
+
+fn clipboard_cache_parent(socket_path: &std::path::Path) -> PathBuf {
+    clipboard_cache_parent_from_env(
+        socket_path,
+        std::env::var_os("DROIDLOOM_CLIPBOARD_CACHE_DIR"),
+        std::env::var_os("XDG_CACHE_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn clipboard_cache_parent_from_env(
+    socket_path: &std::path::Path,
+    override_dir: Option<std::ffi::OsString>,
+    xdg_cache_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    let preferred = override_dir
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            xdg_cache_home
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .or_else(|| {
+                    home.filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                        .filter(|path| path.is_absolute())
+                        .map(|path| path.join(".cache"))
+                })
+                .map(|cache_root| cache_root.join("droidloom/clipboard"))
+        });
+    if let Some(dir) = preferred
+        && fs::create_dir_all(&dir).is_ok()
+        && fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).is_ok()
+    {
+        return dir;
+    }
+    socket_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("/tmp"))
+        .to_path_buf()
+}
 #[derive(Clone)]
 enum Outbound {
     Clip(Arc<Clip>),
@@ -105,6 +169,9 @@ pub(super) struct Clipboard {
     serial: Option<u32>,
     awaiting: Option<String>,
     pending_since: Option<Instant>,
+    lazy_sync: bool,
+    allow_secrets: bool,
+    deferred_offer: bool,
 }
 impl Clipboard {
     #[cfg(test)]
@@ -142,11 +209,17 @@ impl Clipboard {
         // system_server delegates connected FDs after authenticating SystemUI.
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666))?;
         listener.set_nonblocking(true)?;
+        let cache_parent = clipboard_cache_parent(&path);
         let directory = Arc::new(
             tempfile::Builder::new()
                 .prefix("clipboard-")
-                .tempdir_in(path.parent().unwrap())?,
+                .tempdir_in(&cache_parent)?,
         );
+        let lazy_sync = resolve_lazy_sync(
+            std::env::var("DROIDLOOM_CLIPBOARD_SYNC").ok().as_deref(),
+            std::env::var("DROIDLOOM_MODE").ok().as_deref(),
+        );
+        let allow_secrets = std::env::var("DROIDLOOM_CLIPBOARD_ALLOW_SECRETS").as_deref() == Ok("1");
         let (wake, notify) = UnixDatagram::pair()?;
         wake.set_nonblocking(true)?;
         notify.set_nonblocking(true)?;
@@ -180,6 +253,9 @@ impl Clipboard {
             serial: None,
             awaiting: None,
             pending_since: None,
+            lazy_sync,
+            allow_secrets,
+            deferred_offer: false,
         })
     }
     pub fn seat(&mut self, seat: &wl_seat::WlSeat, qh: &QueueHandle<App>) {
@@ -190,6 +266,12 @@ impl Clipboard {
         self.focused = focused;
         if !focused {
             self.serial = None;
+            return;
+        }
+        if self.deferred_offer {
+            self.deferred_offer = false;
+            self.pending_since = Some(Instant::now());
+            self.start_native_transfer();
         }
     }
     pub fn serial(&mut self, serial: u32) {
@@ -229,6 +311,7 @@ impl Clipboard {
     }
     pub fn selection(&mut self, offer: Option<Offer>) {
         self.ready = true;
+        self.deferred_offer = false;
         if let Some(old) = self.offer.take() {
             old.destroy();
         }
@@ -245,23 +328,51 @@ impl Clipboard {
         if offer.is_none() && self.current.as_ref().is_some_and(|c| c.description.empty()) {
             return;
         }
+        if offer
+            .as_ref()
+            .is_some_and(|_| is_sensitive_offer(&mimes, self.allow_secrets))
+        {
+            self.offer = offer;
+            self.pending_since = None;
+            return;
+        }
         self.revision += 1;
         self.generation.store(self.revision, Ordering::Release);
         self.publish_pending = false;
         self.awaiting = None;
-        self.pending_since = Some(Instant::now());
         self.outbound(Outbound::Sync(self.revision));
-        let desc = Description {
-            id: self.id(),
-            base: self.revision,
-            ..Default::default()
-        };
         let Some(offer) = offer else {
+            self.pending_since = Some(Instant::now());
+            let desc = Description {
+                id: self.id(),
+                base: self.revision,
+                ..Default::default()
+            };
             self.import(Clip {
                 description: desc,
                 files: vec![],
             });
             return;
+        };
+        self.offer = Some(offer);
+        if self.lazy_sync && !self.focused {
+            self.deferred_offer = true;
+            self.pending_since = None;
+            return;
+        }
+        self.pending_since = Some(Instant::now());
+        self.start_native_transfer();
+    }
+    fn start_native_transfer(&mut self) {
+        let Some(offer) = self.offer.as_ref() else {
+            self.pending_since = None;
+            return;
+        };
+        let mimes = offer.mimes();
+        let desc = Description {
+            id: self.id(),
+            base: self.revision,
+            ..Default::default()
         };
         let mut selected = Vec::new();
         if let Some(m) = [
@@ -290,7 +401,6 @@ impl Clipboard {
             selected.push(m.clone());
         }
         if selected.is_empty() {
-            self.offer = Some(offer);
             self.import(Clip {
                 description: desc,
                 files: vec![],
@@ -299,7 +409,6 @@ impl Clipboard {
         }
         if self.workers.fetch_add(1, Ordering::AcqRel) >= 8 {
             self.workers.fetch_sub(1, Ordering::AcqRel);
-            self.offer = Some(offer);
             self.pending_since = None;
             return;
         }
@@ -313,12 +422,10 @@ impl Clipboard {
                 Err(_) => {
                     self.workers.fetch_sub(1, Ordering::AcqRel);
                     self.pending_since = None;
-                    self.offer = Some(offer);
                     return;
                 }
             }
         }
-        self.offer = Some(offer);
         let events = self.events.clone();
         let directory = self.directory.clone();
         let generation = self.generation.clone();
@@ -433,6 +540,7 @@ impl Clipboard {
                     self.revision += 1;
                     self.generation.store(self.revision, Ordering::Release);
                     clip.description.base = self.revision;
+                    self.deferred_offer = false;
                     self.awaiting = None;
                     self.pending_since = None;
                     self.current = Some(Arc::new(clip));
@@ -916,6 +1024,49 @@ mod tests {
         assert_eq!(clip.description.blobs.len(), 1);
         assert_eq!(clip.description.blobs[0].mime, "image/png");
         assert_eq!(clip.description.blobs[0].size, expected_len);
+    }
+    #[test]
+    fn sensitive_offers_are_filtered_unless_explicitly_allowed() {
+        let kde_secret = vec![TEXT.into(), KDE_PASSWORD_HINT.into()];
+        let qt_secret = vec![TEXT.into(), QT_EXCLUDE_HISTORY_HINT.into()];
+        let normal = vec![TEXT.into(), "application/x-kde-onlyReplaceEmpty".into()];
+        assert!(is_sensitive_offer(&kde_secret, false));
+        assert!(is_sensitive_offer(&qt_secret, false));
+        assert!(!is_sensitive_offer(&normal, false));
+        assert!(!is_sensitive_offer(&kde_secret, true));
+        assert!(!is_sensitive_offer(&qt_secret, true));
+    }
+    #[test]
+    fn lazy_sync_resolution_follows_mode_and_override() {
+        assert!(resolve_lazy_sync(None, Some("desktop")));
+        assert!(!resolve_lazy_sync(None, Some("mobile")));
+        assert!(!resolve_lazy_sync(None, None));
+        assert!(!resolve_lazy_sync(Some("eager"), Some("desktop")));
+        assert!(resolve_lazy_sync(Some("focus"), Some("mobile")));
+    }
+    #[test]
+    fn clipboard_cache_dir_prefers_xdg_cache_over_runtime_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("runtime/clipboard.sock");
+        let cache_home = dir.path().join("xdg-cache");
+        let resolved = clipboard_cache_parent_from_env(
+            &sock,
+            None,
+            Some(cache_home.clone().into_os_string()),
+            None,
+        );
+        assert_eq!(resolved, cache_home.join("droidloom/clipboard"));
+        assert!(resolved.is_dir());
+
+        let override_dir = dir.path().join("custom-cache");
+        let resolved_override = clipboard_cache_parent_from_env(
+            &sock,
+            Some(override_dir.clone().into_os_string()),
+            Some(cache_home.into_os_string()),
+            None,
+        );
+        assert_eq!(resolved_override, override_dir);
+        assert!(resolved_override.is_dir());
     }
 }
 

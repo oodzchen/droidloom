@@ -87,6 +87,20 @@ struct Arguments {
     /// Host-mapped UID of system_server, which hands SystemUI the brightness socket.
     #[arg(long, default_value_t = 1000)]
     brightness_uid: u32,
+    /// Disable host backlight bridging (also DROIDLOOM_HOST_BRIGHTNESS=0 or desktop mode).
+    #[arg(long)]
+    disable_brightness: bool,
+}
+
+fn brightness_enabled(flag_disabled: bool, env_override: Option<&str>, mode: Option<&str>) -> bool {
+    if flag_disabled {
+        return false;
+    }
+    match env_override {
+        Some("1" | "true") => true,
+        Some("0" | "false") => false,
+        _ => !matches!(mode, Some("desktop")),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -479,6 +493,11 @@ fn run(arguments: &Arguments) -> io::Result<()> {
     if listeners.is_empty() {
         return Err(io::Error::other("no device socket to serve"));
     }
+    let enable_brightness = brightness_enabled(
+        arguments.disable_brightness,
+        std::env::var("DROIDLOOM_HOST_BRIGHTNESS").ok().as_deref(),
+        std::env::var("DROIDLOOM_MODE").ok().as_deref(),
+    );
     let haptics = Arc::new(Haptics {
         bus: Bus(Mutex::new(None)),
         playing: Mutex::new(None),
@@ -531,7 +550,10 @@ fn run(arguments: &Arguments) -> io::Result<()> {
                         Endpoint::Fingerprint => fingerprint::serve(&Arc::new(socket)),
                         Endpoint::Credential => credential::serve(&socket),
                         Endpoint::Location => location::serve(&Arc::new(socket)),
-                        Endpoint::Brightness => brightness::serve(&Arc::new(socket), &bus),
+                        Endpoint::Brightness if enable_brightness => {
+                            brightness::serve(&Arc::new(socket), &bus)
+                        }
+                        Endpoint::Brightness => brightness::serve_disabled(&socket),
                         _ => serve(&socket, endpoint, &haptics, &bus),
                     };
                     if let Err(error) = served {
@@ -626,5 +648,15 @@ mod tests {
             Some(Endpoint::Brightness)
         ));
         assert!(endpoint_of(Path::new("/run/user/1000/droidloom/audio.sock")).is_none());
+    }
+
+    #[test]
+    fn brightness_policy_respects_flag_env_and_mode() {
+        assert!(!brightness_enabled(true, Some("1"), Some("mobile")));
+        assert!(!brightness_enabled(false, None, Some("desktop")));
+        assert!(brightness_enabled(false, None, Some("mobile")));
+        assert!(brightness_enabled(false, None, None));
+        assert!(brightness_enabled(false, Some("1"), Some("desktop")));
+        assert!(!brightness_enabled(false, Some("0"), Some("mobile")));
     }
 }

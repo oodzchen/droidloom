@@ -242,6 +242,12 @@ fn watch(
     }
 }
 
+/// Serves one Android connection when host backlight bridging is disabled.
+pub fn serve_disabled(socket: &SeqPacket) -> io::Result<()> {
+    send(socket, &Message::BrightnessUnavailable)?;
+    drain(socket)
+}
+
 /// Serves one Android connection.
 pub fn serve(socket: &Arc<SeqPacket>, bus: &Bus) -> io::Result<()> {
     let Some(backlight) = Backlight::find(Path::new(BACKLIGHTS)).map(Arc::new) else {

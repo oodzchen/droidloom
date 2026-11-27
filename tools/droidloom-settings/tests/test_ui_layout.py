@@ -227,6 +227,61 @@ class UiLayoutTests(unittest.TestCase):
             dlg.close()
             wait_all_workers(3000)
 
+    def test_integration_hardware_and_storage_controls_layout(self) -> None:
+        win = MainWindow(initial_page="integration")
+        try:
+            win.show()
+            for width, height in ((1100, 760), (560, 640)):
+                win.resize(width, height)
+                self.app.processEvents()
+                integ = win.page_integration
+                self.assertGreaterEqual(integ.clipboard_sync_combo.count(), 3)
+                self.assertGreaterEqual(integ.host_brightness_combo.count(), 3)
+                for lbl in (integ.clipboard_hint_lbl, integ.bridge_hint_lbl):
+                    self.assertTrue(lbl.isVisible())
+                    need_h = lbl.heightForWidth(max(80, lbl.width()))
+                    self.assertGreaterEqual(lbl.height(), need_h - 1)
+
+            hw = win.page_hardware
+            self.assertGreaterEqual(hw.audio_volume_mode_combo.count(), 4)
+            self.assertEqual(hw.cpu_quota_spin.specialValueText(), "不限")
+            self.assertEqual(hw.swap_max_spin.specialValueText(), "不限")
+            self.assertEqual(hw.cpu_weight_spin.value(), 100)
+            self.assertEqual(hw.io_weight_spin.value(), 100)
+            hw._apply_effective_limits_to_ui(
+                {
+                    "MemoryHigh": "13276307456",
+                    "MemoryMax": "16595382272",
+                    "MemorySwapMax": "infinity",
+                    "TasksMax": "8192",
+                    "CPUQuotaPerSecUSec": "infinity",
+                    "AllowedCPUs": "",
+                    "CPUWeight": "[not set]",
+                    "IOWeight": "[not set]",
+                }
+            )
+            self.assertEqual(hw.mem_high_spin.value(), 12661)
+            self.assertEqual(hw.mem_max_spin.value(), 15827)
+            self.assertEqual(hw.tasks_max_spin.value(), 8192)
+
+            disp = win.page_display
+            disp._highlight_rotation("lock", 1)
+            self.assertEqual(disp.rot_buttons[1].property("role"), "primary")
+            self.assertEqual(disp.rot_buttons[0].property("role"), "")
+            self.assertEqual(disp.free_rot_btn.property("role"), "")
+            disp._highlight_rotation("free", 0)
+            self.assertEqual(disp.free_rot_btn.property("role"), "primary")
+            self.assertTrue(all(b.property("role") == "" for b in disp.rot_buttons.values()))
+
+            st = win.page_storage
+            self.assertFalse(hasattr(st, "share_user_chk"))
+            self.assertFalse(hasattr(st, "xdg_table"))
+            self.assertEqual(st.add_recommended_btn.text(), "添加推荐目录")
+        finally:
+            win.close()
+            wait_all_workers(3000)
+            self.app.processEvents()
+
 
 if __name__ == "__main__":
     unittest.main()

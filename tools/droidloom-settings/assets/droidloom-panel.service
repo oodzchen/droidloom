@@ -6,6 +6,7 @@ After=graphical-session.target
 [Service]
 Type=dbus
 BusName=org.droidloom.ControlCenter
+EnvironmentFile=-%h/.config/droidloom/panel.env
 ExecStart=@PANEL_DAEMON_EXEC@
 Restart=on-failure
 RestartSec=2

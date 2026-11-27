@@ -433,30 +433,95 @@ def load_resource_limits(path: Path = CGROUP_DROPIN_PATH) -> ResourceLimits:
     return limits
 
 
-def save_resource_limits(limits: ResourceLimits) -> tuple[bool, str]:
+def query_droidloomd_effective_limits() -> dict[str, str]:
+    try:
+        res = _run(
+            [
+                "systemctl",
+                "show",
+                "droidloomd.service",
+                "--property=MemoryHigh,MemoryMax,MemorySwapMax,TasksMax,CPUQuotaPerSecUSec,AllowedCPUs,CPUWeight,IOWeight",
+            ],
+            timeout=5.0,
+        )
+        info: dict[str, str] = {}
+        for line in res.stdout.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                info[k.strip()] = v.strip()
+        return info
+    except Exception:
+        return {}
+
+
+def _parse_systemd_cpu_quota_percent(raw: str) -> int | None:
+    text = raw.strip().lower()
+    if not text or text in ("infinity", "[not set]"):
+        return None
+    m = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)(ms|s)", text)
+    if not m:
+        return None
+    val = float(m.group(1))
+    unit = m.group(2)
+    seconds = val / 1000.0 if unit == "ms" else val
+    pct = round(seconds * 100.0)
+    return pct if pct > 0 else None
+
+
+def parse_effective_resource_limits(props: dict[str, str]) -> ResourceLimits:
+    """Parse `systemctl show` properties into user-friendly ResourceLimits."""
+
+    def _mem_mib(key: str) -> int | None:
+        raw = props.get(key, "").strip()
+        if not raw or raw in ("infinity", "[not set]") or not raw.isdigit():
+            return None
+        return max(1, round(int(raw) / (1024 * 1024)))
+
+    def _weight(key: str) -> int | None:
+        raw = props.get(key, "").strip()
+        if raw in ("", "[not set]"):
+            return 100
+        if raw.isdigit():
+            v = int(raw)
+            if 1 <= v <= 10000:
+                return v
+        return 100
+
+    tasks_raw = props.get("TasksMax", "").strip()
+    tasks_max = (
+        int(tasks_raw)
+        if tasks_raw.isdigit() and 0 < int(tasks_raw) <= 100000
+        else None
+    )
+    return ResourceLimits(
+        cpu_quota_percent=_parse_systemd_cpu_quota_percent(
+            props.get("CPUQuotaPerSecUSec", "")
+        ),
+        allowed_cpus=props.get("AllowedCPUs", "").strip(),
+        cpu_weight=_weight("CPUWeight"),
+        memory_high_mb=_mem_mib("MemoryHigh"),
+        memory_max_mb=_mem_mib("MemoryMax"),
+        memory_swap_max_mb=_mem_mib("MemorySwapMax"),
+        tasks_max=tasks_max,
+        io_weight=_weight("IOWeight"),
+    )
+
+
+def build_resource_limits_dropin(limits: ResourceLimits) -> tuple[bool, str | None, str]:
+    """Validate and format droidloomd.service drop-in content (None means remove overrides)."""
     lines = ["[Service]"]
-    props: list[str] = []
 
     if limits.cpu_quota_percent and limits.cpu_quota_percent > 0:
         lines.append(f"CPUQuota={limits.cpu_quota_percent}%")
-        props.append(f"CPUQuota={limits.cpu_quota_percent}%")
-    else:
-        props.append("CPUQuota=")
 
     if limits.allowed_cpus.strip():
         cpus = limits.allowed_cpus.strip()
         if not re.fullmatch(r"[0-9,\-]+", cpus):
-            return False, "AllowedCPUs 格式无效（示例：0-3 或 0,2,4）"
+            return False, None, "AllowedCPUs 格式无效（示例：0-3 或 0,2,4）"
         lines.append(f"AllowedCPUs={cpus}")
-        props.append(f"AllowedCPUs={cpus}")
-    else:
-        props.append("AllowedCPUs=")
 
     if limits.cpu_weight and 1 <= limits.cpu_weight <= 10000:
         lines.append(f"CPUWeight={limits.cpu_weight}")
-        props.append(f"CPUWeight={limits.cpu_weight}")
-    else:
-        props.append("CPUWeight=")
 
     for attr, key in (
         ("memory_high_mb", "MemoryHigh"),
@@ -466,32 +531,32 @@ def save_resource_limits(limits: ResourceLimits) -> tuple[bool, str]:
         val = getattr(limits, attr)
         if val is not None and val > 0:
             lines.append(f"{key}={val}M")
-            props.append(f"{key}={val}M")
-        else:
-            props.append(f"{key}=infinity")
 
     if limits.tasks_max and limits.tasks_max > 0:
         lines.append(f"TasksMax={limits.tasks_max}")
-        props.append(f"TasksMax={limits.tasks_max}")
-    else:
-        props.append("TasksMax=infinity")
 
     if limits.io_weight and 1 <= limits.io_weight <= 10000:
         lines.append(f"IOWeight={limits.io_weight}")
-        props.append(f"IOWeight={limits.io_weight}")
-    else:
-        props.append("IOWeight=")
 
-    has_any = len(lines) > 1
+    if len(lines) == 1:
+        return True, None, ""
+    return True, "\n".join(lines) + "\n", ""
+
+
+def save_resource_limits(limits: ResourceLimits) -> tuple[bool, str]:
+    ok, dropin_text, err_msg = build_resource_limits_dropin(limits)
+    if not ok:
+        return False, err_msg
+
     tmp_path: Path | None = None
     try:
         dropin_dir = CGROUP_DROPIN_PATH.parent
         cmds = ["set -euo pipefail"]
-        if has_any:
+        if dropin_text is not None:
             fd, tmp = tempfile.mkstemp(prefix="droidloom-res-", suffix=".conf")
             tmp_path = Path(tmp)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write("\n".join(lines) + "\n")
+                fh.write(dropin_text)
             cmds.extend(
                 [
                     f"mkdir -p {shlex.quote(str(dropin_dir))}",
@@ -501,9 +566,12 @@ def save_resource_limits(limits: ResourceLimits) -> tuple[bool, str]:
         else:
             cmds.append(f"rm -f {shlex.quote(str(CGROUP_DROPIN_PATH))}")
 
+        # Remove legacy `systemctl set-property` overrides so unit defaults
+        # (MemoryHigh=40%, MemoryMax=50%, TasksMax=8192) apply when fields are 0.
+        cmds.append(
+            "rm -rf /etc/systemd/system.control/droidloomd.service.d /run/systemd/system.control/droidloomd.service.d"
+        )
         cmds.append("systemctl daemon-reload")
-        prop_args = " ".join(shlex.quote(p) for p in props)
-        cmds.append(f"systemctl set-property droidloomd.service {prop_args} || true")
 
         res = _run(["pkexec", "/bin/sh", "-c", " ; ".join(cmds)], timeout=60.0)
         if res.returncode != 0:

@@ -13,7 +13,6 @@ from ..backend.android_bridge import trigger_media_rescan
 from ..backend.cell_config import (
     directory_disk_usage_bytes,
     load_cell_json,
-    resolve_user_folders,
     save_cell_spec_privileged,
     validate_shared_directory_entry,
 )
@@ -44,25 +43,14 @@ class StoragePage(QtWidgets.QWidget):
         root = QtWidgets.QVBoxLayout(self)
         root.setSpacing(14)
 
-        # 1. XDG user folders auto-share
-        xdg_box, xdg_lay = make_section_card("目录")
-        self.share_user_chk = QtWidgets.QCheckBox("自动共享用户目录")
-        self.share_user_chk.setChecked(bool(self._cell.get("share_user_folders", False)))
-        xdg_lay.addWidget(self.share_user_chk)
-
-        self.xdg_table = QtWidgets.QTableWidget(0, 4)
-        self.xdg_table.setHorizontalHeaderLabels(["Android", "宿主机", "状态", "setgid"])
-        self.xdg_table.horizontalHeader().setStretchLastSection(False)
-        self.xdg_table.horizontalHeader().setSectionResizeMode(
-            1, QtWidgets.QHeaderView.ResizeMode.Stretch
-        )
-        self.xdg_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
-        style_table(self.xdg_table)
-        xdg_lay.addWidget(wrap_resizable(self.xdg_table, default_height=175, min_height=90))
-        root.addWidget(xdg_box)
-
-        # 2. Custom shared_storage_directories
+        # 1. Explicit shared_storage_directories
         custom_box, custom_lay = make_section_card("映射")
+        custom_lay.addWidget(
+            WrappingLabel(
+                "仅将下方显式添加的目录映射到 Android 的 /storage/emulated/0/<名称>（已禁用自动共享整个用户目录以保护宿主机文件；推荐使用 ~/Downloads/Droidloom）。",
+                muted=True,
+            )
+        )
         self.custom_table = QtWidgets.QTableWidget(0, 3)
         self.custom_table.setHorizontalHeaderLabels(["宿主机路径", "Android 名称", "GID"])
         self.custom_table.horizontalHeader().setSectionResizeMode(
@@ -74,12 +62,15 @@ class StoragePage(QtWidgets.QWidget):
         c_btns = QtWidgets.QHBoxLayout()
         c_btns.setSpacing(8)
         add_btn = QtWidgets.QPushButton("添加...")
+        self.add_recommended_btn = QtWidgets.QPushButton("添加推荐目录")
         remove_btn = QtWidgets.QPushButton("移除")
         rescan_btn = QtWidgets.QPushButton("刷新媒体库")
         add_btn.clicked.connect(self._add_custom_dir)
+        self.add_recommended_btn.clicked.connect(self._add_recommended_dir)
         remove_btn.clicked.connect(self._remove_custom_dir)
         rescan_btn.clicked.connect(self._rescan_media)
         c_btns.addWidget(add_btn)
+        c_btns.addWidget(self.add_recommended_btn)
         c_btns.addWidget(remove_btn)
         c_btns.addStretch(1)
         c_btns.addWidget(rescan_btn)
@@ -147,24 +138,6 @@ class StoragePage(QtWidgets.QWidget):
         spawn_worker(self, self._workers, fn, on_ok, on_err)
 
     def _populate(self) -> None:
-        folders = resolve_user_folders(self._uid)
-        self.xdg_table.setRowCount(len(folders))
-        for r, item in enumerate(folders):
-            self.xdg_table.setItem(
-                r, 0, QtWidgets.QTableWidgetItem(f"/storage/emulated/0/{item['android_name']}")
-            )
-            self.xdg_table.setItem(r, 1, QtWidgets.QTableWidgetItem(item["source"]))
-            if not item["exists"]:
-                st = "目录不存在"
-            elif not item["owned"]:
-                st = "非当前用户/主组所有"
-            else:
-                st = "可共享"
-            self.xdg_table.setItem(r, 2, QtWidgets.QTableWidgetItem(st))
-            self.xdg_table.setItem(
-                r, 3, QtWidgets.QTableWidgetItem("已设置" if item["setgid"] else "未设置")
-            )
-
         custom = self._cell.get("shared_storage_directories") or []
         self.custom_table.setRowCount(0)
         for entry in custom:
@@ -220,6 +193,28 @@ class StoragePage(QtWidgets.QWidget):
             return
         self._insert_custom_row(src, name, gid)
 
+    def _add_recommended_dir(self) -> None:
+        rec_dir = Path.home() / "Downloads" / "Droidloom"
+        try:
+            rec_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(rec_dir, 0o2755)
+        except OSError as exc:
+            show_message(self, "推荐目录", f"无法准备 {rec_dir}: {exc}", is_error=True)
+            return
+        src = str(rec_dir)
+        for r in range(self.custom_table.rowCount()):
+            src_it = self.custom_table.item(r, 0)
+            name_it = self.custom_table.item(r, 1)
+            if (src_it and src_it.text() == src) or (name_it and name_it.text() == "Droidloom"):
+                show_message(self, "推荐目录", f"{src}（Droidloom）已在映射列表中，请记得点击「保存」。")
+                return
+        err = validate_shared_directory_entry(src, "Droidloom", self._gid)
+        if err:
+            show_message(self, "无效目录", err, is_error=True)
+            return
+        self._insert_custom_row(src, "Droidloom", self._gid)
+        show_message(self, "推荐目录", f"已添加 {src} -> /storage/emulated/0/Droidloom，请点击下方「保存」使配置生效。")
+
     def _remove_custom_dir(self) -> None:
         r = self.custom_table.currentRow()
         if r >= 0:
@@ -246,7 +241,7 @@ class StoragePage(QtWidgets.QWidget):
             show_message(self, "错误", "未能加载 /etc/droidloom/cell.json", is_error=True)
             return
         updated = copy.deepcopy(self._cell)
-        updated["share_user_folders"] = self.share_user_chk.isChecked()
+        updated["share_user_folders"] = False
 
         dirs = []
         setgid_candidates = []
@@ -262,11 +257,6 @@ class StoragePage(QtWidgets.QWidget):
             dirs.append({"source": src, "android_name": name, "host_gid": gid})
             setgid_candidates.append(src)
         updated["shared_storage_directories"] = dirs
-
-        if self.share_user_chk.isChecked():
-            for item in resolve_user_folders(self._uid):
-                if item["exists"] and item["owned"]:
-                    setgid_candidates.append(item["source"])
 
         data_dir = self.data_dir_edit.text().strip()
         if data_dir:

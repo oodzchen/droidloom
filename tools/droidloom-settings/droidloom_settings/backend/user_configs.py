@@ -233,24 +233,47 @@ def list_drm_connectors() -> list[dict[str, str]]:
     return connectors
 
 
+def _parse_env_file(path: Path) -> dict[str, str]:
+    env: dict[str, str] = {}
+    if not path.is_file():
+        return env
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+            v = v[1:-1]
+        if k:
+            env[k] = v
+    return env
+
+
+def _format_env_value(val: str) -> str:
+    if "\n" in val or "\r" in val:
+        raise ValueError("环境变量值不能包含换行符")
+    if any(ch.isspace() or ch in "\"'#$\\`" for ch in val):
+        escaped = val.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return val
+
+
 @dataclass
 class AudioSettings:
     allow_capture: bool = False
     target: str = ""
     remote: str = ""
     capture_sink: bool = False
+    volume_mode: str = "auto"  # "auto" | "stream" | "host" | "off"
 
 
 def load_audio_settings(config_dir: Path | None = None) -> AudioSettings:
     cfg_dir = config_dir or xdg_config_dir()
-    env_path = cfg_dir / "audio.env"
-    allow_capture = False
-    if env_path.is_file():
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line.startswith("DROIDLOOM_AUDIO_CAPTURE="):
-                val = line.split("=", 1)[1].strip().strip("\"'")
-                allow_capture = val == "1"
+    env_map = _parse_env_file(cfg_dir / "audio.env")
+    allow_capture = env_map.get("DROIDLOOM_AUDIO_CAPTURE", "0") == "1"
+    raw_vol = env_map.get("DROIDLOOM_HOST_VOLUME", "").strip().lower()
+    volume_mode = raw_vol if raw_vol in ("stream", "host", "off") else "auto"
 
     dropin_path = (
         Path.home() / ".config/systemd/user/droidloom-audio.service.d/90-droidloom-settings.conf"
@@ -274,13 +297,18 @@ def load_audio_settings(config_dir: Path | None = None) -> AudioSettings:
         target=target,
         remote=remote,
         capture_sink=capture_sink,
+        volume_mode=volume_mode,
     )
 
 
 def save_audio_settings(settings: AudioSettings, config_dir: Path | None = None) -> None:
+    if settings.volume_mode not in ("auto", "stream", "host", "off"):
+        raise ValueError(f"无效的音量模式: {settings.volume_mode}")
     cfg_dir = config_dir or xdg_config_dir()
     env_path = cfg_dir / "audio.env"
     lines = [f"DROIDLOOM_AUDIO_CAPTURE={'1' if settings.allow_capture else '0'}\n"]
+    if settings.volume_mode != "auto":
+        lines.append(f"DROIDLOOM_HOST_VOLUME={settings.volume_mode}\n")
     atomic_write_text(env_path, "".join(lines), mode=0o644)
 
     dropin_path = (
@@ -300,6 +328,104 @@ def save_audio_settings(settings: AudioSettings, config_dir: Path | None = None)
         atomic_write_text(dropin_path, content, mode=0o644)
     elif dropin_path.is_file():
         dropin_path.unlink()
+
+
+@dataclass
+class ClipboardSettings:
+    sync_mode: str = "auto"  # "auto" | "focus" | "eager"
+    allow_secrets: bool = False
+    cache_dir: str = ""
+
+
+def load_clipboard_settings(config_dir: Path | None = None) -> ClipboardSettings:
+    cfg_dir = config_dir or xdg_config_dir()
+    env_map = _parse_env_file(cfg_dir / "clipboard.env")
+    raw_sync = env_map.get("DROIDLOOM_CLIPBOARD_SYNC", "").strip().lower()
+    sync_mode = raw_sync if raw_sync in ("focus", "eager") else "auto"
+    allow_secrets = env_map.get("DROIDLOOM_CLIPBOARD_ALLOW_SECRETS", "0") == "1"
+    cache_dir = env_map.get("DROIDLOOM_CLIPBOARD_CACHE_DIR", "").strip()
+    return ClipboardSettings(
+        sync_mode=sync_mode,
+        allow_secrets=allow_secrets,
+        cache_dir=cache_dir,
+    )
+
+
+def save_clipboard_settings(settings: ClipboardSettings, config_dir: Path | None = None) -> None:
+    if settings.sync_mode not in ("auto", "focus", "eager"):
+        raise ValueError(f"无效的剪贴板同步模式: {settings.sync_mode}")
+    cache_dir = settings.cache_dir.strip()
+    if cache_dir:
+        if "\n" in cache_dir or "\r" in cache_dir:
+            raise ValueError("剪贴板缓存目录路径无效")
+        if not Path(cache_dir).is_absolute():
+            raise ValueError("剪贴板缓存目录必须为绝对路径")
+    cfg_dir = config_dir or xdg_config_dir()
+    env_path = cfg_dir / "clipboard.env"
+    lines = [
+        f"DROIDLOOM_CLIPBOARD_ALLOW_SECRETS={'1' if settings.allow_secrets else '0'}\n",
+    ]
+    if settings.sync_mode != "auto":
+        lines.append(f"DROIDLOOM_CLIPBOARD_SYNC={settings.sync_mode}\n")
+    if cache_dir:
+        lines.append(f"DROIDLOOM_CLIPBOARD_CACHE_DIR={_format_env_value(cache_dir)}\n")
+    atomic_write_text(env_path, "".join(lines), mode=0o644)
+
+
+@dataclass
+class DevicesSettings:
+    host_brightness: str = "auto"  # "auto" | "0" | "1"
+
+
+def load_devices_settings(config_dir: Path | None = None) -> DevicesSettings:
+    cfg_dir = config_dir or xdg_config_dir()
+    env_map = _parse_env_file(cfg_dir / "devices.env")
+    raw = env_map.get("DROIDLOOM_HOST_BRIGHTNESS", "").strip().lower()
+    if raw in ("0", "false"):
+        val = "0"
+    elif raw in ("1", "true"):
+        val = "1"
+    else:
+        val = "auto"
+    return DevicesSettings(host_brightness=val)
+
+
+def save_devices_settings(settings: DevicesSettings, config_dir: Path | None = None) -> None:
+    if settings.host_brightness not in ("auto", "0", "1"):
+        raise ValueError(f"无效的背光控制模式: {settings.host_brightness}")
+    cfg_dir = config_dir or xdg_config_dir()
+    env_path = cfg_dir / "devices.env"
+    if settings.host_brightness == "auto":
+        env_path.unlink(missing_ok=True)
+        return
+    atomic_write_text(
+        env_path,
+        f"DROIDLOOM_HOST_BRIGHTNESS={settings.host_brightness}\n",
+        mode=0o644,
+    )
+
+
+@dataclass
+class PanelEnvSettings:
+    mpris_fetch_remote_art: bool = False
+
+
+def load_panel_env_settings(config_dir: Path | None = None) -> PanelEnvSettings:
+    cfg_dir = config_dir or xdg_config_dir()
+    env_map = _parse_env_file(cfg_dir / "panel.env")
+    return PanelEnvSettings(
+        mpris_fetch_remote_art=env_map.get("DROIDLOOM_MPRIS_FETCH_REMOTE_ART", "0") == "1"
+    )
+
+
+def save_panel_env_settings(settings: PanelEnvSettings, config_dir: Path | None = None) -> None:
+    cfg_dir = config_dir or xdg_config_dir()
+    env_path = cfg_dir / "panel.env"
+    atomic_write_text(
+        env_path,
+        f"DROIDLOOM_MPRIS_FETCH_REMOTE_ART={'1' if settings.mpris_fetch_remote_art else '0'}\n",
+        mode=0o644,
+    )
 
 
 def load_session_mode() -> str:

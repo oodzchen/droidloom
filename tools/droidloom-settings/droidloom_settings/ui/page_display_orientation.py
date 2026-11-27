@@ -147,15 +147,21 @@ class DisplayOrientationPage(QtWidgets.QWidget):
         rot_col.setSpacing(10)
         rot_btns = QtWidgets.QHBoxLayout()
         rot_btns.setSpacing(6)
+        self.rot_buttons: dict[int, QtWidgets.QPushButton] = {}
         for idx, text in ROTATION_LABELS.items():
             b = QtWidgets.QPushButton(text)
             b.clicked.connect(lambda _=False, r=idx: self._apply_rotation("lock", r))
+            self.rot_buttons[idx] = b
             rot_btns.addWidget(b)
-        free_btn = QtWidgets.QPushButton("自由")
-        free_btn.clicked.connect(lambda: self._apply_rotation("free", 0))
-        rot_btns.addWidget(free_btn)
+        self.free_rot_btn = QtWidgets.QPushButton("自由")
+        self.free_rot_btn.clicked.connect(lambda: self._apply_rotation("free", 0))
+        rot_btns.addWidget(self.free_rot_btn)
         rot_btns.addStretch(1)
         rot_col.addLayout(rot_btns)
+        if self._orient.last_manual_rotation is not None:
+            self._highlight_rotation("lock", self._orient.last_manual_rotation)
+        else:
+            self._highlight_rotation("free", 0)
 
         self.fixed_rot_combo = QtWidgets.QComboBox()
         self.fixed_rot_combo.addItem("锁定 (enabled)", "enabled")
@@ -422,7 +428,7 @@ class DisplayOrientationPage(QtWidgets.QWidget):
                     f"SensorService: {snap.sensor_status}",
                     "info",
                 )
-                self.dial.set_rotation(snap.user_rotation_index)
+                self._highlight_rotation(snap.user_rotation_mode, snap.user_rotation_index)
                 idx_f = self.fixed_rot_combo.findData(snap.fixed_to_user_rotation)
                 if idx_f >= 0:
                     self.fixed_rot_combo.setCurrentIndex(idx_f)
@@ -443,9 +449,20 @@ class DisplayOrientationPage(QtWidgets.QWidget):
 
         self._spawn(fetch, done)
 
+    def _highlight_rotation(self, mode: str, rotation: int) -> None:
+        self._active_rotation_mode = mode
+        self._active_rotation_index = rotation % 4
+        self.dial.set_rotation(self._active_rotation_index)
+        for idx, btn in self.rot_buttons.items():
+            set_button_role(
+                btn,
+                "primary" if (mode == "lock" and idx == self._active_rotation_index) else "",
+            )
+        set_button_role(self.free_rot_btn, "primary" if mode == "free" else "")
+
     def _apply_rotation(self, mode: str, rotation: int) -> None:
         fixed = str(self.fixed_rot_combo.currentData())
-        self.dial.set_rotation(rotation)
+        self._highlight_rotation(mode, rotation)
         self._spawn(
             lambda: apply_android_rotation(mode, rotation, fixed_mode=fixed),
             lambda r: (

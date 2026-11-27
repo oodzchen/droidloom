@@ -11,16 +11,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from droidloom_settings.backend.orientation_daemon import map_orientation_to_rotation
 from droidloom_settings.backend.user_configs import (
+    AudioSettings,
+    ClipboardSettings,
     DensityConfig,
+    DevicesSettings,
     OrientationConfig,
+    PanelEnvSettings,
     WindowPolicyData,
     WindowPreference,
     get_desktop_launch_resolution,
+    load_audio_settings,
+    load_clipboard_settings,
     load_density_config,
+    load_devices_settings,
     load_orientation_config,
+    load_panel_env_settings,
     load_window_policy,
+    save_audio_settings,
+    save_clipboard_settings,
     save_density_config,
+    save_devices_settings,
     save_orientation_config,
+    save_panel_env_settings,
     save_window_policy,
     set_desktop_launch_resolution,
 )
@@ -91,6 +103,62 @@ class UserConfigsTests(unittest.TestCase):
         self.assertEqual(map_orientation_to_rotation("normal", 0), 0)
         self.assertEqual(map_orientation_to_rotation("right-up", 1), 2)
         self.assertIsNone(map_orientation_to_rotation("undefined", 0))
+
+    def test_audio_volume_mode_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            save_audio_settings(AudioSettings(allow_capture=True, volume_mode="stream"), config_dir=d)
+            loaded = load_audio_settings(config_dir=d)
+            self.assertTrue(loaded.allow_capture)
+            self.assertEqual(loaded.volume_mode, "stream")
+            self.assertIn("DROIDLOOM_HOST_VOLUME=stream", (d / "audio.env").read_text(encoding="utf-8"))
+
+            save_audio_settings(AudioSettings(allow_capture=False, volume_mode="auto"), config_dir=d)
+            loaded_auto = load_audio_settings(config_dir=d)
+            self.assertFalse(loaded_auto.allow_capture)
+            self.assertEqual(loaded_auto.volume_mode, "auto")
+            self.assertNotIn("DROIDLOOM_HOST_VOLUME", (d / "audio.env").read_text(encoding="utf-8"))
+
+    def test_clipboard_settings_round_trip_and_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            cfg = ClipboardSettings(
+                sync_mode="focus",
+                allow_secrets=True,
+                cache_dir="/tmp/droidloom cache dir",
+            )
+            save_clipboard_settings(cfg, config_dir=d)
+            loaded = load_clipboard_settings(config_dir=d)
+            self.assertEqual(loaded.sync_mode, "focus")
+            self.assertTrue(loaded.allow_secrets)
+            self.assertEqual(loaded.cache_dir, "/tmp/droidloom cache dir")
+
+            with self.assertRaises(ValueError):
+                save_clipboard_settings(
+                    ClipboardSettings(sync_mode="auto", cache_dir="relative/path"),
+                    config_dir=d,
+                )
+            with self.assertRaises(ValueError):
+                save_clipboard_settings(
+                    ClipboardSettings(sync_mode="auto", cache_dir="/tmp/bad\nline"),
+                    config_dir=d,
+                )
+
+    def test_devices_and_panel_env_settings_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            save_devices_settings(DevicesSettings(host_brightness="0"), config_dir=d)
+            self.assertEqual(load_devices_settings(config_dir=d).host_brightness, "0")
+            save_devices_settings(DevicesSettings(host_brightness="1"), config_dir=d)
+            self.assertEqual(load_devices_settings(config_dir=d).host_brightness, "1")
+            save_devices_settings(DevicesSettings(host_brightness="auto"), config_dir=d)
+            self.assertFalse((d / "devices.env").exists())
+            self.assertEqual(load_devices_settings(config_dir=d).host_brightness, "auto")
+
+            save_panel_env_settings(PanelEnvSettings(mpris_fetch_remote_art=True), config_dir=d)
+            self.assertTrue(load_panel_env_settings(config_dir=d).mpris_fetch_remote_art)
+            save_panel_env_settings(PanelEnvSettings(mpris_fetch_remote_art=False), config_dir=d)
+            self.assertFalse(load_panel_env_settings(config_dir=d).mpris_fetch_remote_art)
 
 
 if __name__ == "__main__":

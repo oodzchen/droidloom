@@ -11,6 +11,7 @@ from .page_apps_apk import AppsApkPage
 from .page_diagnostics import DiagnosticsPage
 from .page_display_orientation import DisplayOrientationPage
 from .page_hardware import HardwarePage
+from .page_integration import IntegrationPage
 from .page_network import NetworkPage
 from .page_overview import OverviewPage
 from .page_storage import StoragePage
@@ -30,6 +31,7 @@ PAGE_KEYS = [
     ("storage", "存储"),
     ("hardware", "硬件"),
     ("display", "显示"),
+    ("integration", "集成"),
     ("apps", "应用"),
     ("diagnostics", "诊断"),
 ]
@@ -106,6 +108,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.page_storage = StoragePage()
         self.page_hardware = HardwarePage()
         self.page_display = DisplayOrientationPage()
+        self.page_integration = IntegrationPage()
         self.page_apps = AppsApkPage()
         self.page_diagnostics = DiagnosticsPage()
 
@@ -115,6 +118,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.page_storage,
             self.page_hardware,
             self.page_display,
+            self.page_integration,
             self.page_apps,
             self.page_diagnostics,
         ]
@@ -154,6 +158,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.page_overview.status_updated.connect(self._on_status_updated)
         self.page_overview.status_hint.connect(self._on_status_hint)
         self.page_network.status_hint.connect(self._on_status_hint)
+        self.page_integration.status_hint.connect(self._on_status_hint)
 
         idx = next((i for i, (k, _) in enumerate(PAGE_KEYS) if k == initial_page), 0)
         self.nav.setCurrentRow(idx)

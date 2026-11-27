@@ -24,6 +24,8 @@ from ..backend.host_runtime import (
     list_braun_cameras,
     list_pipewire_sinks,
     load_resource_limits,
+    parse_effective_resource_limits,
+    query_droidloomd_effective_limits,
     save_resource_limits,
     systemctl_system_query,
     systemctl_user,
@@ -34,6 +36,7 @@ from .widgets import (
     StatusIndicator,
     WorkerThread,
     WrappingLabel,
+    format_bytes,
     make_form_layout,
     make_section_card,
     make_splitter,
@@ -243,10 +246,19 @@ class HardwarePage(QtWidgets.QWidget):
             self.pw_target_combo.setCurrentText(aud_cfg.target)
         self.pw_remote_edit = QtWidgets.QLineEdit(aud_cfg.remote)
         self.pw_remote_edit.setPlaceholderText("可选 remote")
+        self.audio_volume_mode_combo = QtWidgets.QComboBox()
+        self.audio_volume_mode_combo.addItem("跟随运行模式（桌面独立流 / 移动主音量）", "auto")
+        self.audio_volume_mode_combo.addItem("独立应用流音量 (stream，推荐)", "stream")
+        self.audio_volume_mode_combo.addItem("联动宿主机主音量 (host)", "host")
+        self.audio_volume_mode_combo.addItem("禁用音量同步 (off)", "off")
+        idx_vol = self.audio_volume_mode_combo.findData(aud_cfg.volume_mode)
+        if idx_vol >= 0:
+            self.audio_volume_mode_combo.setCurrentIndex(idx_vol)
 
         aud_form = make_form_layout()
         aud_form.addRow("", self.mic_chk)
         aud_form.addRow("", self.loopback_chk)
+        aud_form.addRow("音量模式:", self.audio_volume_mode_combo)
         aud_form.addRow("输出:", self.pw_target_combo)
         aud_form.addRow("Remote:", self.pw_remote_edit)
         aud_lay.addLayout(aud_form)
@@ -302,7 +314,15 @@ class HardwarePage(QtWidgets.QWidget):
 
         # 4. Systemd cgroup v2 resource limits
         res_box, res_lay = make_section_card("限额")
+        self.res_effective_lbl = WrappingLabel(
+            "正在读取当前生效限额...",
+            muted=True,
+        )
+        res_lay.addWidget(self.res_effective_lbl)
         limits = load_resource_limits()
+        self._saved_limits = limits
+        self._effective_defaults = ResourceLimits(cpu_weight=100, io_weight=100)
+        self._limits_dirty = False
         r_grid = QtWidgets.QGridLayout()
         r_grid.setHorizontalSpacing(14)
         r_grid.setVerticalSpacing(10)
@@ -311,38 +331,59 @@ class HardwarePage(QtWidgets.QWidget):
 
         self.cpu_quota_spin = QtWidgets.QSpinBox()
         self.cpu_quota_spin.setRange(0, 6400)
+        self.cpu_quota_spin.setSpecialValueText("不限")
         self.cpu_quota_spin.setSuffix(" %")
         self.cpu_quota_spin.setValue(limits.cpu_quota_percent or 0)
 
         self.allowed_cpus_edit = QtWidgets.QLineEdit(limits.allowed_cpus)
-        self.allowed_cpus_edit.setPlaceholderText(f"0-{max(0, (os.cpu_count() or 1) - 1)}")
+        self.allowed_cpus_edit.setPlaceholderText(f"不限 (0-{max(0, (os.cpu_count() or 1) - 1)})")
 
         self.cpu_weight_spin = QtWidgets.QSpinBox()
         self.cpu_weight_spin.setRange(0, 10000)
-        self.cpu_weight_spin.setValue(limits.cpu_weight or 0)
+        self.cpu_weight_spin.setSpecialValueText("默认 (100)")
+        self.cpu_weight_spin.setValue(limits.cpu_weight or 100)
 
         self.mem_high_spin = QtWidgets.QSpinBox()
         self.mem_high_spin.setRange(0, 262144)
+        self.mem_high_spin.setSpecialValueText("默认 (40%)")
         self.mem_high_spin.setSuffix(" MiB")
         self.mem_high_spin.setValue(limits.memory_high_mb or 0)
 
         self.mem_max_spin = QtWidgets.QSpinBox()
         self.mem_max_spin.setRange(0, 262144)
+        self.mem_max_spin.setSpecialValueText("默认 (50%)")
         self.mem_max_spin.setSuffix(" MiB")
         self.mem_max_spin.setValue(limits.memory_max_mb or 0)
 
         self.swap_max_spin = QtWidgets.QSpinBox()
         self.swap_max_spin.setRange(0, 262144)
+        self.swap_max_spin.setSpecialValueText("不限")
         self.swap_max_spin.setSuffix(" MiB")
         self.swap_max_spin.setValue(limits.memory_swap_max_mb or 0)
 
         self.tasks_max_spin = QtWidgets.QSpinBox()
         self.tasks_max_spin.setRange(0, 100000)
+        self.tasks_max_spin.setSpecialValueText("默认 (8192)")
         self.tasks_max_spin.setValue(limits.tasks_max or 0)
 
         self.io_weight_spin = QtWidgets.QSpinBox()
         self.io_weight_spin.setRange(0, 10000)
-        self.io_weight_spin.setValue(limits.io_weight or 0)
+        self.io_weight_spin.setSpecialValueText("默认 (100)")
+        self.io_weight_spin.setValue(limits.io_weight or 100)
+
+        for w in (
+            self.cpu_quota_spin,
+            self.cpu_weight_spin,
+            self.mem_high_spin,
+            self.mem_max_spin,
+            self.swap_max_spin,
+            self.tasks_max_spin,
+            self.io_weight_spin,
+        ):
+            w.valueChanged.connect(lambda _v: setattr(self, "_limits_dirty", True))
+        self.allowed_cpus_edit.textEdited.connect(
+            lambda _t: setattr(self, "_limits_dirty", True)
+        )
 
         align_r = QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter
         rows_cfg = [
@@ -405,11 +446,12 @@ class HardwarePage(QtWidgets.QWidget):
                 gl_drv = self.client.games_driver()
             except Exception:
                 gl_drv = ""
+            eff_limits = query_droidloomd_effective_limits()
             snap = query_android_snapshot()
-            return gpus, sinks, braun_unit, cams, dev_unit, gl_drv, snap
+            return gpus, sinks, braun_unit, cams, dev_unit, gl_drv, eff_limits, snap
 
         def done(data):
-            gpus, sinks, braun_unit, cams, dev_unit, gl_drv, snap = data
+            gpus, sinks, braun_unit, cams, dev_unit, gl_drv, eff_limits, snap = data
             if gpus:
                 self.gpu_list_lbl.setText(
                     "已检测到宿主机 GPU:\n" + "\n".join(f"• {g.label}" for g in gpus)
@@ -452,6 +494,9 @@ class HardwarePage(QtWidgets.QWidget):
                 idx = self.gl_driver_combo.findData(gl_drv)
                 if idx >= 0:
                     self.gl_driver_combo.setCurrentIndex(idx)
+
+            if eff_limits:
+                self._apply_effective_limits_to_ui(eff_limits)
 
             if snap.connected:
                 self.soc_edit.setText(snap.soc_model_persist)
@@ -574,6 +619,7 @@ class HardwarePage(QtWidgets.QWidget):
             target=target,
             remote=self.pw_remote_edit.text().strip(),
             capture_sink=self.loopback_chk.isChecked(),
+            volume_mode=str(self.audio_volume_mode_combo.currentData() or "auto"),
         )
         save_audio_settings(cfg)
         self._spawn(
@@ -589,29 +635,101 @@ class HardwarePage(QtWidgets.QWidget):
             ),
         )
 
+    def _apply_effective_limits_to_ui(self, eff_limits: dict[str, str]) -> None:
+        eff = parse_effective_resource_limits(eff_limits)
+        self._effective_defaults = eff
+        if not self._limits_dirty:
+            pairs = (
+                (self.cpu_quota_spin, self._saved_limits.cpu_quota_percent, eff.cpu_quota_percent),
+                (self.cpu_weight_spin, self._saved_limits.cpu_weight, eff.cpu_weight),
+                (self.mem_high_spin, self._saved_limits.memory_high_mb, eff.memory_high_mb),
+                (self.mem_max_spin, self._saved_limits.memory_max_mb, eff.memory_max_mb),
+                (self.swap_max_spin, self._saved_limits.memory_swap_max_mb, eff.memory_swap_max_mb),
+                (self.tasks_max_spin, self._saved_limits.tasks_max, eff.tasks_max),
+                (self.io_weight_spin, self._saved_limits.io_weight, eff.io_weight),
+            )
+            for spin, saved_val, eff_val in pairs:
+                if saved_val is None:
+                    spin.blockSignals(True)
+                    spin.setValue(eff_val or 0)
+                    spin.blockSignals(False)
+            if not self._saved_limits.allowed_cpus:
+                self.allowed_cpus_edit.blockSignals(True)
+                self.allowed_cpus_edit.setText(eff.allowed_cpus)
+                self.allowed_cpus_edit.blockSignals(False)
+
+        def _fmt_mem(raw: str | None) -> str:
+            if not raw or raw in ("infinity", "[not set]"):
+                return "无上限"
+            return format_bytes(int(raw)) if raw.isdigit() else raw
+
+        mh = _fmt_mem(eff_limits.get("MemoryHigh"))
+        mm = _fmt_mem(eff_limits.get("MemoryMax"))
+        tm = eff_limits.get("TasksMax") or "—"
+        self.res_effective_lbl.setText(
+            f"当前生效：内存软限 {mh}，硬限 {mm}，线程上限 {tm}（未修改项保持单元默认策略，点击「重置」恢复默认）"
+        )
+
     def _apply_resources(self) -> None:
+        def _resolve_num(
+            spin: QtWidgets.QSpinBox,
+            saved_val: int | None,
+            eff_default: int | None,
+        ) -> int | None:
+            v = spin.value()
+            if v <= 0:
+                return None
+            if saved_val is None and eff_default is not None and v == eff_default:
+                return None
+            return v
+
+        eff = self._effective_defaults
         limits = ResourceLimits(
-            cpu_quota_percent=self.cpu_quota_spin.value() or None,
-            allowed_cpus=self.allowed_cpus_edit.text().strip(),
-            cpu_weight=self.cpu_weight_spin.value() or None,
-            memory_high_mb=self.mem_high_spin.value() or None,
-            memory_max_mb=self.mem_max_spin.value() or None,
-            memory_swap_max_mb=self.swap_max_spin.value() or None,
-            tasks_max=self.tasks_max_spin.value() or None,
-            io_weight=self.io_weight_spin.value() or None,
+            cpu_quota_percent=_resolve_num(
+                self.cpu_quota_spin, self._saved_limits.cpu_quota_percent, eff.cpu_quota_percent
+            ),
+            allowed_cpus=(
+                ""
+                if not self._saved_limits.allowed_cpus
+                and self.allowed_cpus_edit.text().strip() == eff.allowed_cpus
+                else self.allowed_cpus_edit.text().strip()
+            ),
+            cpu_weight=_resolve_num(
+                self.cpu_weight_spin, self._saved_limits.cpu_weight, eff.cpu_weight
+            ),
+            memory_high_mb=_resolve_num(
+                self.mem_high_spin, self._saved_limits.memory_high_mb, eff.memory_high_mb
+            ),
+            memory_max_mb=_resolve_num(
+                self.mem_max_spin, self._saved_limits.memory_max_mb, eff.memory_max_mb
+            ),
+            memory_swap_max_mb=_resolve_num(
+                self.swap_max_spin, self._saved_limits.memory_swap_max_mb, eff.memory_swap_max_mb
+            ),
+            tasks_max=_resolve_num(
+                self.tasks_max_spin, self._saved_limits.tasks_max, eff.tasks_max
+            ),
+            io_weight=_resolve_num(
+                self.io_weight_spin, self._saved_limits.io_weight, eff.io_weight
+            ),
         )
         self._spawn(
             lambda: save_resource_limits(limits),
-            lambda r: show_message(self, "资源限制", r[1], is_error=not r[0]),
+            lambda r: (
+                show_message(self, "资源限制", r[1], is_error=not r[0]),
+                setattr(self, "_saved_limits", load_resource_limits()) if r[0] else None,
+                setattr(self, "_limits_dirty", False) if r[0] else None,
+                self.refresh_state() if r[0] else None,
+            ),
         )
 
     def _reset_resources(self) -> None:
-        self.cpu_quota_spin.setValue(0)
-        self.allowed_cpus_edit.clear()
-        self.cpu_weight_spin.setValue(0)
-        self.mem_high_spin.setValue(0)
-        self.mem_max_spin.setValue(0)
-        self.swap_max_spin.setValue(0)
-        self.tasks_max_spin.setValue(0)
-        self.io_weight_spin.setValue(0)
-        self._apply_resources()
+        self._spawn(
+            lambda: save_resource_limits(ResourceLimits()),
+            lambda r: (
+                show_message(self, "资源限制", r[1], is_error=not r[0]),
+                setattr(self, "_saved_limits", ResourceLimits()) if r[0] else None,
+                setattr(self, "_limits_dirty", False) if r[0] else None,
+                self.refresh_state() if r[0] else None,
+            ),
+        )

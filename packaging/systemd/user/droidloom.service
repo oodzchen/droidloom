@@ -12,6 +12,7 @@ NotifyAccess=main
 EnvironmentFile=/usr/lib/environment.d/60-droidloom.conf
 Environment=DROIDLOOM_MODE=desktop
 EnvironmentFile=-%t/droidloom/session.env
+EnvironmentFile=-%h/.config/droidloom/clipboard.env
 ExecStartPre=/usr/bin/systemctl start droidloomd.service
 ExecStart=/usr/bin/droidloom-wayland
 ExecStartPost=/usr/bin/droidloomctl start --cell

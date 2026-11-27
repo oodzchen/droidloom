@@ -112,6 +112,12 @@ that retirement. Completed-frame, cross-task and rejected-cancellation paths
 have executable regressions. These contracts do not establish physical device
 or application-level delivery qualification.
 
+A mouse wheel or touchpad reaches Android as its own mouse `ACTION_SCROLL` at
+the pointer, on a separate device, so it holds no contact and never joins a
+touch gesture. A wheel notch, or its high-resolution fraction, is one Android
+notch; a touchpad moves content as far as the fingers move, 64 dp per notch at
+the task's density.
+
 ## Wayland and Denial
 
 The presenter requires `xdg-shell` and `linux-dmabuf` v4 feedback. Without
@@ -381,7 +387,9 @@ carries it as `Density` (minor 11, capability `TASK_DENSITY`), sent before the
 configure it belongs to; the framework sets it as the task's requested
 `densityDpi` override, or drops the override for 0 or the display's own
 density. The file is watched, so a change reaches open windows at once.
-Without it, a task gets 230 per unit of scale.
+Without it, a task gets 230 per unit of scale. Since a task's density
+overrides the display's, `droidloomctl dpi` writes `dpiPerScale` along with
+the display density, creating the file when missing.
 
 A window's density is known only once the window exists, after its activity
 started, and a density that arrives then is a configuration change: Android
@@ -392,6 +400,23 @@ window is open. Composer queues it as task command 7, which names no task, and
 keeps it for a restarted framework; the framework creates application tasks
 with it (`Task.Builder` hunk of `0005-droidloom-authoritative-tasks.patch`). A
 window that opens on an output of another density still relaunches once.
+
+### On-screen keyboard
+
+Where the compositor offers `denial_insets_manager_v1` version 2 and Android
+negotiated `TASK_KEYBOARD_INSET`, the presenter asks for a keyboard inset
+object for each task window. The compositor then stops moving the window clear
+of its on-screen keyboard and reports the height the keyboard covers instead.
+The presenter converts it to the task's buffer pixels and sends it as
+`KeyboardInset` (protocol minor 14) after the window's first configure and
+whenever the height or the window's scale changes. Composer queues it as task
+command 8, latest value only. The framework keeps the height per task and gives
+the task's windows an IME inset source of that height, attached to their
+bottom edge (`0001-droidloom-bottom-navigation-insets.patch`), then dispatches
+their insets again. Apps react as to Android's own keyboard: `adjustResize`
+shrinks the content above it, `adjustPan` pans the focused field into view, and
+edge-to-edge apps read `WindowInsets.Type.ime()`. Android's own IME source is
+untouched; Droidloom's headless input method never shows a window.
 
 ### Vsync
 

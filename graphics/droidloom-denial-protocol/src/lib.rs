@@ -20,7 +20,7 @@ pub const MAGIC: [u8; 4] = *b"DLOM";
 /// Protocol major implemented by this crate.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// Protocol minor implemented by this crate.
-pub const PROTOCOL_MINOR: u16 = 12;
+pub const PROTOCOL_MINOR: u16 = 14;
 /// Wire version retained by existing records, including initial negotiation.
 pub const BASE_PROTOCOL_MINOR: u16 = 3;
 /// Wire version introducing task activation.
@@ -80,6 +80,10 @@ pub mod capability {
     pub const TASK_DENSITY: u64 = 1 << 15;
     /// Android names the task a dialog-like task opened over.
     pub const TASK_PARENTS: u64 = 1 << 16;
+    /// Android tells the host when a task's window hides the status bar.
+    pub const TASK_FULLSCREEN: u64 = 1 << 17;
+    /// The host tells each task how much of it the on-screen keyboard covers.
+    pub const TASK_KEYBOARD_INSET: u64 = 1 << 18;
 
     /// Capabilities required for every protocol-v1 session.
     pub const REQUIRED_V1: u64 = TASK_WINDOWS
@@ -279,6 +283,15 @@ pub enum AndroidMessage {
         /// Parent task, or `None` when the task has none.
         parent: Option<TaskObjectId>,
     },
+    /// The task's window hid the status bar, as an immersive game does: the
+    /// host shows the task fullscreen until it shows the bar again.
+    /// Requires negotiated `TASK_FULLSCREEN`.
+    SetFullscreen {
+        /// Owning task.
+        object: TaskObjectId,
+        /// Whether the task asks to be shown fullscreen.
+        fullscreen: bool,
+    },
     /// Answer a host liveness probe.
     Pong {
         /// Cookie copied from the matching host ping.
@@ -376,6 +389,13 @@ pub enum DenialMessage {
         object: TaskObjectId,
         /// Dots per inch; 0 follows Android's display density.
         dpi: u32,
+    },
+    /// How much of the task's bottom edge the host's on-screen keyboard covers.
+    KeyboardInset {
+        /// Task the keyboard covers.
+        object: TaskObjectId,
+        /// Covered height in Android buffer pixels; 0 when the keyboard is hidden.
+        height: u32,
     },
     /// Update Denial-owned system-bar and cutout insets.
     Insets {
@@ -534,6 +554,17 @@ pub enum InputEvent {
         y_fixed: i32,
         /// Normalized pressure from zero through 65,535.
         pressure: u16,
+    },
+    /// One wheel or touchpad scroll at a pointer position.
+    Scroll {
+        /// Logical x coordinate in signed 16.16 fixed point.
+        x_fixed: i32,
+        /// Logical y coordinate in signed 16.16 fixed point.
+        y_fixed: i32,
+        /// Vertical wheel notches in signed 16.16 fixed point, positive up.
+        vertical_fixed: i32,
+        /// Horizontal wheel notches in signed 16.16 fixed point, positive right.
+        horizontal_fixed: i32,
     },
     /// Linux input key transition.
     Key {
@@ -1242,6 +1273,7 @@ const OP_BIND_INPUT_ROUTE: u16 = 0x0010;
 const OP_REQUEST_RENDER_TARGETS: u16 = 0x0011;
 const OP_SET_KEEP_SCREEN_ON: u16 = 0x0012;
 const OP_SET_PARENT: u16 = 0x0013;
+const OP_SET_FULLSCREEN: u16 = 0x0014;
 
 const OP_SERVER_HELLO: u16 = 0x8001;
 const OP_FORMAT_FEEDBACK: u16 = 0x8002;
@@ -1261,6 +1293,7 @@ const OP_REQUEST_INPUT_CHANNEL: u16 = 0x800f;
 const OP_SCENE_PRESENTED: u16 = 0x8010;
 const OP_FRAME_GRANT: u16 = 0x8011;
 const OP_DENSITY: u16 = 0x8012;
+const OP_KEYBOARD_INSET: u16 = 0x8013;
 
 /// Encode one Android-to-Denial message.
 ///
@@ -1457,6 +1490,10 @@ pub fn encode_android(message: &AndroidMessage) -> Result<EncodedPacket, WireErr
             };
             payload.u64(parent);
             (OP_SET_PARENT, valid_object(*object)?, Vec::new())
+        }
+        AndroidMessage::SetFullscreen { object, fullscreen } => {
+            payload.u32(u32::from(*fullscreen));
+            (OP_SET_FULLSCREEN, valid_object(*object)?, Vec::new())
         }
         AndroidMessage::Pong { cookie } => {
             payload.u64(*cookie);
@@ -1711,6 +1748,23 @@ pub fn decode_android(
             };
             (AndroidMessage::SetParent { object, parent }, Vec::new())
         }
+        OP_SET_FULLSCREEN => {
+            valid_object(object)?;
+            let fullscreen = match payload.u32()? {
+                0 => false,
+                1 => true,
+                value => {
+                    return Err(WireError::InvalidEnum {
+                        field: "fullscreen",
+                        value: u64::from(value),
+                    });
+                }
+            };
+            (
+                AndroidMessage::SetFullscreen { object, fullscreen },
+                Vec::new(),
+            )
+        }
         OP_PONG => {
             require_connection(header.object)?;
             (
@@ -1854,6 +1908,15 @@ pub fn encode_denial(message: &DenialMessage) -> Result<EncodedPacket, WireError
         DenialMessage::Density { object, dpi } => {
             payload.u32(*dpi);
             (OP_DENSITY, valid_object(*object)?)
+        }
+        DenialMessage::KeyboardInset { object, height } => {
+            if *height > 16384 {
+                return Err(WireError::Limit {
+                    field: "keyboard inset",
+                });
+            }
+            payload.u32(*height);
+            (OP_KEYBOARD_INSET, valid_object(*object)?)
         }
         DenialMessage::Insets {
             object,
@@ -2121,6 +2184,16 @@ pub fn decode_denial(
                 dpi: payload.u32()?,
             }
         }
+        OP_KEYBOARD_INSET => {
+            valid_object(object)?;
+            let height = payload.u32()?;
+            if height > 16384 {
+                return Err(WireError::Limit {
+                    field: "keyboard inset",
+                });
+            }
+            DenialMessage::KeyboardInset { object, height }
+        }
         OP_INSETS => {
             valid_object(object)?;
             DenialMessage::Insets {
@@ -2386,6 +2459,8 @@ fn finish_packet(
         OP_SET_KEEP_SCREEN_ON => 10,
         OP_DENSITY => 11,
         OP_SET_PARENT => 12,
+        OP_SET_FULLSCREEN => 13,
+        OP_KEYBOARD_INSET => 14,
         _ => BASE_PROTOCOL_MINOR,
     };
     bytes.extend_from_slice(&minor.to_le_bytes());
@@ -2540,6 +2615,18 @@ fn encode_input(payload: &mut Writer, event: InputEvent) {
             payload.u8(2);
             payload.u8(action as u8);
         }
+        InputEvent::Scroll {
+            x_fixed,
+            y_fixed,
+            vertical_fixed,
+            horizontal_fixed,
+        } => {
+            payload.u8(3);
+            payload.i32(x_fixed);
+            payload.i32(y_fixed);
+            payload.i32(vertical_fixed);
+            payload.i32(horizontal_fixed);
+        }
     }
 }
 
@@ -2559,6 +2646,12 @@ fn decode_input(payload: &mut Reader<'_>) -> Result<InputEvent, WireError> {
         }),
         2 => Ok(InputEvent::Navigation {
             action: decode_navigation_action(payload.u8()?)?,
+        }),
+        3 => Ok(InputEvent::Scroll {
+            x_fixed: payload.i32()?,
+            y_fixed: payload.i32()?,
+            vertical_fixed: payload.i32()?,
+            horizontal_fixed: payload.i32()?,
         }),
         value => Err(WireError::InvalidEnum {
             field: "input event",
@@ -2953,6 +3046,14 @@ mod tests {
                 object: OBJECT,
                 parent: None,
             },
+            AndroidMessage::SetFullscreen {
+                object: OBJECT,
+                fullscreen: true,
+            },
+            AndroidMessage::SetFullscreen {
+                object: OBJECT,
+                fullscreen: false,
+            },
             AndroidMessage::Pong { cookie: 99 },
         ] {
             round_trip_android(&message);
@@ -3061,6 +3162,10 @@ mod tests {
                 object: OBJECT,
                 dpi: 230,
             },
+            DenialMessage::KeyboardInset {
+                object: OBJECT,
+                height: 780,
+            },
             DenialMessage::Insets {
                 object: OBJECT,
                 left: 0,
@@ -3116,6 +3221,12 @@ mod tests {
             },
             InputEvent::Navigation {
                 action: NavigationAction::Back,
+            },
+            InputEvent::Scroll {
+                x_fixed: 10 << 16,
+                y_fixed: 20 << 16,
+                vertical_fixed: -(1 << 15),
+                horizontal_fixed: 0,
             },
         ] {
             round_trip_denial(&DenialMessage::Input {

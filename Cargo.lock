@@ -487,6 +487,7 @@ dependencies = [
  "clap",
  "droidloom-audio-client",
  "droidloom-audio-protocol",
+ "droidloom-device-protocol",
  "libc",
  "serde_json",
  "tempfile",
@@ -745,6 +746,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 

@@ -26,6 +26,8 @@ pub struct Task {
     /// The task this one opened over and leaves running, such as the app
     /// behind a dialog; 0 for none.
     pub parent: u64,
+    /// The task's window asked to hide the status bar.
+    pub fullscreen: bool,
 }
 
 impl Task {
@@ -250,6 +252,7 @@ impl Backend {
             TaskAction::Hide => (4, 0, 0),
             TaskAction::Show => (5, 0, 0),
             TaskAction::Density { dpi } => (6, u64::from(dpi), 0),
+            TaskAction::KeyboardInset { height } => (8, u64::from(height), 0),
             TaskAction::NewTaskDensity { .. } => unreachable!("resolved above"),
         };
         Some(CommandBinding {
@@ -351,6 +354,7 @@ impl Backend {
             activate,
             keep_screen_on: task.keep_screen_on,
             parent: task.parent,
+            fullscreen: task.fullscreen,
         })? {
             ControlResponse::Bound {
                 request_id: actual,
@@ -449,7 +453,7 @@ mod tests {
         socket
     }
     fn register(socket: &SeqPacket, object: u64, expected_activation: bool) {
-        register_state(socket, object, expected_activation, false, 0);
+        register_state(socket, object, expected_activation, false, 0, false);
     }
     fn register_state(
         socket: &SeqPacket,
@@ -457,6 +461,7 @@ mod tests {
         expected_activation: bool,
         expected_keep_screen_on: bool,
         expected_parent: u64,
+        expected_fullscreen: bool,
     ) {
         let ControlRequest::PublishFramework {
             request_id,
@@ -467,6 +472,7 @@ mod tests {
             incarnation,
             keep_screen_on,
             parent,
+            fullscreen,
         } = receive(socket)
         else {
             panic!("expected registration")
@@ -475,6 +481,7 @@ mod tests {
         assert_eq!(activate, expected_activation);
         assert_eq!(keep_screen_on, expected_keep_screen_on);
         assert_eq!(parent, expected_parent);
+        assert_eq!(fullscreen, expected_fullscreen);
         assert!(incarnation > 0);
         send(
             socket,
@@ -503,6 +510,7 @@ mod tests {
             package: "org.example.app".into(),
             keep_screen_on: false,
             parent: 0,
+            fullscreen: false,
         }
     }
 
@@ -513,9 +521,9 @@ mod tests {
         let listener = SeqPacketListener::bind(&path).unwrap();
         let server = thread::spawn(move || {
             let socket = hello(&listener);
-            register_state(&socket, 100, false, false, 0);
-            register_state(&socket, 100, false, true, 0); // No removal before it.
-            register_state(&socket, 100, false, false, 0);
+            register_state(&socket, 100, false, false, 0, false);
+            register_state(&socket, 100, false, true, 0, false); // No removal before it.
+            register_state(&socket, 100, false, false, 0, false);
         });
         let mut backend = Backend::new(path);
         let first = backend.register(task(1)).unwrap();
@@ -534,9 +542,9 @@ mod tests {
         let listener = SeqPacketListener::bind(&path).unwrap();
         let server = thread::spawn(move || {
             let socket = hello(&listener);
-            register_state(&socket, 100, false, false, 0);
-            register_state(&socket, 100, false, false, 7); // No removal before it.
-            register_state(&socket, 100, false, false, 0);
+            register_state(&socket, 100, false, false, 0, false);
+            register_state(&socket, 100, false, false, 7, false); // No removal before it.
+            register_state(&socket, 100, false, false, 0, false);
         });
         let mut backend = Backend::new(path);
         let first = backend.register(task(1)).unwrap();
@@ -544,6 +552,27 @@ mod tests {
         dialog.parent = 7;
         assert_eq!(backend.register(dialog.clone()).unwrap(), first);
         assert_eq!(backend.register(dialog).unwrap(), first); // Unchanged: no I/O.
+        assert_eq!(backend.register(task(1)).unwrap(), first);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn fullscreen_republishes_the_same_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control");
+        let listener = SeqPacketListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let socket = hello(&listener);
+            register_state(&socket, 100, false, false, 0, false);
+            register_state(&socket, 100, false, false, 0, true); // No removal before it.
+            register_state(&socket, 100, false, false, 0, false);
+        });
+        let mut backend = Backend::new(path);
+        let first = backend.register(task(1)).unwrap();
+        let mut game = task(1);
+        game.fullscreen = true;
+        assert_eq!(backend.register(game.clone()).unwrap(), first);
+        assert_eq!(backend.register(game).unwrap(), first); // Unchanged: no I/O.
         assert_eq!(backend.register(task(1)).unwrap(), first);
         server.join().unwrap();
     }

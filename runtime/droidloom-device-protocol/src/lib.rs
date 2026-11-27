@@ -1,11 +1,15 @@
-//! Records between Android's haptics, camera and fingerprint services and the
-//! host user's device broker, one per `SOCK_SEQPACKET` packet, little-endian.
+//! Records between Android's haptics, camera, fingerprint and GNSS services
+//! and the host user's device broker, one per `SOCK_SEQPACKET` packet,
+//! little-endian.
 //!
 //! Every record starts with [`MAGIC`] and a 32-bit kind. Haptics are fire and
 //! forget except the query; the camera list and connect each get one reply.
 //! A camera session is braun's own socket, passed beside [`Message::CameraSession`].
 //! A fingerprint query gets one reply; a verification sends events until one
 //! that ends it ([`Scan::ends`]), also after a cancel.
+//! Location runs from [`Message::LocationStart`] to [`Message::LocationStop`]
+//! or the connection's end; meanwhile the broker sends the engine's state on
+//! each change and every fix.
 //!
 //! Credential prompts go the other way, from root's supervisor to the broker
 //! on their own socket: [`Message::CredentialAsk`] shows the host's sheet, the
@@ -13,6 +17,13 @@
 //! supervisor closes it, or [`Message::CredentialCancelled`] when the user
 //! closed it. [`Message::CredentialOpened`] says the user turned from the
 //! fingerprint to the sheet.
+//!
+//! Volume and brightness come from Droidloom's `SystemUI` through
+//! `system_server`'s host channels, on one socket each. The broker sends the
+//! host's level when Android connects and on every change made on the host;
+//! Android sends its own changes. A level is 0 to 1: the volume as the host's
+//! mixers show it (the cube root of the linear gain), the brightness as a
+//! share of the backlight's range.
 
 use std::fmt;
 
@@ -30,6 +41,8 @@ pub const MAX_TEXT: usize = 256;
 pub const MAX_FINGERS: usize = 16;
 /// Longest PIN or password.
 pub const MAX_SECRET: usize = 1024;
+/// Most satellite signals one record carries.
+pub const MAX_SATELLITES: usize = 128;
 /// Largest record either side sends.
 pub const MAX_RECORD: usize = 8192;
 
@@ -53,6 +66,18 @@ const CREDENTIAL_WRONG: u32 = 50;
 const CREDENTIAL_CANCELLED: u32 = 51;
 const CREDENTIAL_CLOSE: u32 = 52;
 const CREDENTIAL_OPENED: u32 = 53;
+const LOCATION_START: u32 = 64;
+const LOCATION_STOP: u32 = 65;
+const LOCATION_STATE: u32 = 66;
+const LOCATION_FIX: u32 = 67;
+const LOCATION_SATELLITES: u32 = 68;
+const VOLUME_SET: u32 = 80;
+const VOLUME_STATE: u32 = 81;
+const VOLUME_UNAVAILABLE: u32 = 82;
+const BRIGHTNESS_SET: u32 = 96;
+const BRIGHTNESS_RELEASE: u32 = 97;
+const BRIGHTNESS_STATE: u32 = 98;
+const BRIGHTNESS_UNAVAILABLE: u32 = 99;
 
 /// One step of a haptic pattern: `intensity` from 0 to 1 for `ms`; 0 is a pause.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -128,6 +153,112 @@ const SCANS: [Scan; 7] = [
     Scan::Unavailable,
     Scan::Cancelled,
 ];
+
+/// What the host's GNSS engine does, as dmail's `Location1.State` says.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Engine {
+    /// Nobody asks.
+    Off,
+    /// Running, no fix yet.
+    Searching,
+    /// The last fix is current.
+    Fixed,
+    /// No GNSS engine, the modem failed, or dmail is not there.
+    Unavailable,
+}
+
+const ENGINES: [Engine; 4] = [
+    Engine::Off,
+    Engine::Searching,
+    Engine::Fixed,
+    Engine::Unavailable,
+];
+
+/// One position of the host's GNSS engine.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fix {
+    /// Degrees.
+    pub latitude: f64,
+    /// Degrees.
+    pub longitude: f64,
+    /// Horizontal accuracy in metres.
+    pub accuracy: f64,
+    /// Metres above the WGS 84 ellipsoid.
+    pub altitude: Option<f64>,
+    /// Metres a second.
+    pub speed: Option<f64>,
+    /// Degrees from true north.
+    pub heading: Option<f64>,
+    /// Metres, one standard deviation, as the two below; `accuracy` is
+    /// the radius of 68%.
+    pub vertical_accuracy: Option<f64>,
+    /// Metres a second.
+    pub speed_accuracy: Option<f64>,
+    /// Degrees.
+    pub heading_accuracy: Option<f64>,
+    /// When the engine computed it, Unix milliseconds.
+    pub time_ms: i64,
+    /// Satellites it used.
+    pub satellites: u32,
+}
+
+/// A satellite system.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Constellation {
+    /// GPS.
+    Gps,
+    /// GLONASS.
+    Glonass,
+    /// Galileo.
+    Galileo,
+    /// China's BDS.
+    Beidou,
+    /// QZSS.
+    Qzss,
+    /// SBAS.
+    Sbas,
+    /// India's `NavIC` (IRNSS).
+    Navic,
+}
+
+const CONSTELLATIONS: [Constellation; 7] = [
+    Constellation::Gps,
+    Constellation::Glonass,
+    Constellation::Galileo,
+    Constellation::Beidou,
+    Constellation::Qzss,
+    Constellation::Sbas,
+    Constellation::Navic,
+];
+
+/// One signal of one satellite, as the host's engine lists it.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // The engine's flags, as Android takes them.
+pub struct Satellite {
+    /// Its system.
+    pub constellation: Constellation,
+    /// Its number within the system: PRN, or the GLONASS slot (1–24) or
+    /// frequency channel plus 100 (93–106).
+    pub number: u16,
+    /// The band, such as `L1 C/A`, `L5`, `G1` or `E5a`; empty when unknown.
+    pub band: String,
+    /// Carrier frequency, Hz.
+    pub frequency: Option<f64>,
+    /// Carrier to noise density, dB-Hz, while heard.
+    pub cn0: Option<f32>,
+    /// Degrees above the horizon.
+    pub elevation: Option<f32>,
+    /// Degrees from true north.
+    pub azimuth: Option<f32>,
+    /// The engine hears it.
+    pub tracked: bool,
+    /// The last fix used it.
+    pub used: bool,
+    /// The engine holds its ephemeris.
+    pub ephemeris: bool,
+    /// The engine holds its almanac.
+    pub almanac: bool,
+}
 
 /// A record.
 #[derive(Clone, Debug, PartialEq)]
@@ -205,6 +336,57 @@ pub enum Message {
         /// The user proved themself.
         accepted: bool,
     },
+    /// Android wants positions until [`Message::LocationStop`].
+    LocationStart,
+    /// Android no longer wants positions.
+    LocationStop,
+    /// The engine's state, sent at the start and on each change.
+    LocationState {
+        /// What it does.
+        engine: Engine,
+        /// Satellites the last fix used.
+        used: u32,
+        /// Satellites heard now.
+        tracked: u32,
+    },
+    /// A new fix.
+    LocationFix(Fix),
+    /// Every satellite signal the engine lists, sent on each change.
+    LocationSatellites(Vec<Satellite>),
+    /// Android changed its media volume: set the host's default output.
+    VolumeSet {
+        /// 0 to 1, as the host's mixers show it.
+        level: f32,
+        /// Muted.
+        muted: bool,
+    },
+    /// The host's default output, at the start and on each change.
+    VolumeState {
+        /// 0 to 1, as the host's mixers show it.
+        level: f32,
+        /// Muted.
+        muted: bool,
+    },
+    /// The host has no default output.
+    VolumeUnavailable,
+    /// Android changed the screen's brightness: set the host's backlight.
+    BrightnessSet {
+        /// 0 to 1 of the backlight's range.
+        level: f32,
+        /// An app's window asks for it while it shows, as a video player
+        /// does; [`Message::BrightnessRelease`] ends it.
+        window: bool,
+    },
+    /// No window asks for a brightness any more: the host goes back to the
+    /// level before the first window's, unless the user changed it meanwhile.
+    BrightnessRelease,
+    /// The host's backlight, at the start and on each change.
+    BrightnessState {
+        /// 0 to 1 of the backlight's range.
+        level: f32,
+    },
+    /// The host has no backlight.
+    BrightnessUnavailable,
 }
 
 /// A record that does not decode.
@@ -236,6 +418,47 @@ impl Writer {
     }
     fn f32(&mut self, value: f32) {
         self.0.extend_from_slice(&value.to_le_bytes());
+    }
+    fn f64(&mut self, value: f64) {
+        self.0.extend_from_slice(&value.to_le_bytes());
+    }
+    fn i64(&mut self, value: i64) {
+        self.0.extend_from_slice(&value.to_le_bytes());
+    }
+    fn u16(&mut self, value: u16) {
+        self.0.extend_from_slice(&value.to_le_bytes());
+    }
+    /// NaN stands for none.
+    fn maybe_f32(&mut self, value: Option<f32>) {
+        self.f32(value.unwrap_or(f32::NAN));
+    }
+    fn satellites(&mut self, satellites: &[Satellite]) {
+        let satellites = &satellites[..satellites.len().min(MAX_SATELLITES)];
+        // MAX_SATELLITES fits a u32.
+        #[allow(clippy::cast_possible_truncation)]
+        self.u32(satellites.len() as u32);
+        for satellite in satellites {
+            // CONSTELLATIONS has seven entries.
+            #[allow(clippy::cast_possible_truncation)]
+            self.u8(CONSTELLATIONS
+                .iter()
+                .position(|known| *known == satellite.constellation)
+                .unwrap_or(0) as u8);
+            self.u16(satellite.number);
+            self.text(&satellite.band);
+            self.maybe_f64(satellite.frequency);
+            self.maybe_f32(satellite.cn0);
+            self.maybe_f32(satellite.elevation);
+            self.maybe_f32(satellite.azimuth);
+            self.u8(u8::from(satellite.tracked)
+                | u8::from(satellite.used) << 1
+                | u8::from(satellite.ephemeris) << 2
+                | u8::from(satellite.almanac) << 3);
+        }
+    }
+    /// NaN stands for none.
+    fn maybe_f64(&mut self, value: Option<f64>) {
+        self.f64(value.unwrap_or(f64::NAN));
     }
     fn text(&mut self, value: &str) {
         let mut end = value.len().min(MAX_TEXT);
@@ -278,6 +501,76 @@ impl Reader<'_> {
             .then_some(value)
             .ok_or(Invalid("not a number"))
     }
+    /// A level from 0 to 1.
+    fn level(&mut self) -> Result<f32, Invalid> {
+        let value = self.f32()?;
+        (0.0..=1.0)
+            .contains(&value)
+            .then_some(value)
+            .ok_or(Invalid("level outside 0 to 1"))
+    }
+    fn f64(&mut self) -> Result<f64, Invalid> {
+        let value = f64::from_le_bytes(self.take()?);
+        value
+            .is_finite()
+            .then_some(value)
+            .ok_or(Invalid("not a number"))
+    }
+    fn maybe_f64(&mut self) -> Result<Option<f64>, Invalid> {
+        let value = f64::from_le_bytes(self.take()?);
+        if value.is_nan() {
+            return Ok(None);
+        }
+        value
+            .is_finite()
+            .then_some(Some(value))
+            .ok_or(Invalid("infinite"))
+    }
+    fn i64(&mut self) -> Result<i64, Invalid> {
+        self.take().map(i64::from_le_bytes)
+    }
+    fn u16(&mut self) -> Result<u16, Invalid> {
+        self.take().map(u16::from_le_bytes)
+    }
+    fn maybe_f32(&mut self) -> Result<Option<f32>, Invalid> {
+        let value = f32::from_le_bytes(self.take()?);
+        if value.is_nan() {
+            return Ok(None);
+        }
+        value
+            .is_finite()
+            .then_some(Some(value))
+            .ok_or(Invalid("infinite"))
+    }
+    fn satellites(&mut self) -> Result<Vec<Satellite>, Invalid> {
+        let count = self.count(MAX_SATELLITES)?;
+        (0..count).map(|_| self.satellite()).collect()
+    }
+    fn satellite(&mut self) -> Result<Satellite, Invalid> {
+        let constellation = *CONSTELLATIONS
+            .get(usize::from(self.u8()?))
+            .ok_or(Invalid("unknown constellation"))?;
+        let number = self.u16()?;
+        let band = self.text()?;
+        let frequency = self.maybe_f64()?;
+        let cn0 = self.maybe_f32()?;
+        let elevation = self.maybe_f32()?;
+        let azimuth = self.maybe_f32()?;
+        let flags = self.u8()?;
+        Ok(Satellite {
+            constellation,
+            number,
+            band,
+            frequency,
+            cn0,
+            elevation,
+            azimuth,
+            tracked: flags & 1 != 0,
+            used: flags & 2 != 0,
+            ephemeris: flags & 4 != 0,
+            almanac: flags & 8 != 0,
+        })
+    }
     fn text(&mut self) -> Result<String, Invalid> {
         let length = usize::from(u16::from_le_bytes(self.take()?));
         if length > MAX_TEXT {
@@ -295,6 +588,28 @@ impl Reader<'_> {
         let (head, rest) = self.0.split_at_checked(length).ok_or(Invalid("short"))?;
         self.0 = rest;
         Ok(head.to_vec())
+    }
+    fn fix(&mut self) -> Result<Fix, Invalid> {
+        let fix = Fix {
+            latitude: self.f64()?,
+            longitude: self.f64()?,
+            accuracy: self.f64()?,
+            altitude: self.maybe_f64()?,
+            speed: self.maybe_f64()?,
+            heading: self.maybe_f64()?,
+            vertical_accuracy: self.maybe_f64()?,
+            speed_accuracy: self.maybe_f64()?,
+            heading_accuracy: self.maybe_f64()?,
+            time_ms: self.i64()?,
+            satellites: self.u32()?,
+        };
+        if !(-90.0..=90.0).contains(&fix.latitude)
+            || !(-180.0..=180.0).contains(&fix.longitude)
+            || fix.accuracy < 0.0
+        {
+            return Err(Invalid("position out of range"));
+        }
+        Ok(fix)
     }
     fn count(&mut self, most: usize) -> Result<usize, Invalid> {
         usize::try_from(self.u32()?)
@@ -325,6 +640,7 @@ pub fn valid_pattern(steps: &[Step]) -> bool {
 
 impl Message {
     /// The record's bytes.
+    #[allow(clippy::too_many_lines)] // One arm for each record kind.
     pub fn encode(&self) -> Vec<u8> {
         let writer = match self {
             Message::HapticsQuery => Writer::new(HAPTICS_QUERY),
@@ -430,6 +746,68 @@ impl Message {
                 writer.u8(u8::from(*accepted));
                 writer
             }
+            Message::LocationStart => Writer::new(LOCATION_START),
+            Message::LocationStop => Writer::new(LOCATION_STOP),
+            Message::LocationState {
+                engine,
+                used,
+                tracked,
+            } => {
+                let mut writer = Writer::new(LOCATION_STATE);
+                // ENGINES has four entries.
+                #[allow(clippy::cast_possible_truncation)]
+                writer.u8(ENGINES
+                    .iter()
+                    .position(|known| known == engine)
+                    .unwrap_or(3) as u8);
+                writer.u32(*used);
+                writer.u32(*tracked);
+                writer
+            }
+            Message::LocationFix(fix) => {
+                let mut writer = Writer::new(LOCATION_FIX);
+                writer.f64(fix.latitude);
+                writer.f64(fix.longitude);
+                writer.f64(fix.accuracy);
+                writer.maybe_f64(fix.altitude);
+                writer.maybe_f64(fix.speed);
+                writer.maybe_f64(fix.heading);
+                writer.maybe_f64(fix.vertical_accuracy);
+                writer.maybe_f64(fix.speed_accuracy);
+                writer.maybe_f64(fix.heading_accuracy);
+                writer.i64(fix.time_ms);
+                writer.u32(fix.satellites);
+                writer
+            }
+            Message::LocationSatellites(satellites) => {
+                let mut writer = Writer::new(LOCATION_SATELLITES);
+                writer.satellites(satellites);
+                writer
+            }
+            Message::VolumeSet { level, muted } | Message::VolumeState { level, muted } => {
+                let mut writer = Writer::new(if matches!(self, Message::VolumeSet { .. }) {
+                    VOLUME_SET
+                } else {
+                    VOLUME_STATE
+                });
+                writer.f32(*level);
+                writer.u8(u8::from(*muted));
+                writer
+            }
+            Message::VolumeUnavailable => Writer::new(VOLUME_UNAVAILABLE),
+            Message::BrightnessSet { level, window } => {
+                let mut writer = Writer::new(BRIGHTNESS_SET);
+                writer.f32(*level);
+                writer.u8(u8::from(*window));
+                writer
+            }
+            Message::BrightnessRelease => Writer::new(BRIGHTNESS_RELEASE),
+            Message::BrightnessState { level } => {
+                let mut writer = Writer::new(BRIGHTNESS_STATE);
+                writer.f32(*level);
+                writer
+            }
+            Message::BrightnessUnavailable => Writer::new(BRIGHTNESS_UNAVAILABLE),
         };
         writer.0
     }
@@ -439,6 +817,7 @@ impl Message {
     /// # Errors
     /// A record of another protocol, an unknown kind, or one whose fields do
     /// not fit their bounds.
+    #[allow(clippy::too_many_lines)] // One arm for each record kind.
     pub fn decode(bytes: &[u8]) -> Result<Self, Invalid> {
         let mut reader = Reader(bytes);
         if reader.take::<8>()? != MAGIC {
@@ -526,6 +905,35 @@ impl Message {
             CREDENTIAL_CLOSE => Message::CredentialClose {
                 accepted: reader.u8()? != 0,
             },
+            LOCATION_START => Message::LocationStart,
+            LOCATION_STOP => Message::LocationStop,
+            LOCATION_STATE => Message::LocationState {
+                engine: *ENGINES
+                    .get(usize::from(reader.u8()?))
+                    .ok_or(Invalid("unknown engine state"))?,
+                used: reader.u32()?,
+                tracked: reader.u32()?,
+            },
+            LOCATION_FIX => Message::LocationFix(reader.fix()?),
+            LOCATION_SATELLITES => Message::LocationSatellites(reader.satellites()?),
+            VOLUME_SET => Message::VolumeSet {
+                level: reader.level()?,
+                muted: reader.u8()? != 0,
+            },
+            VOLUME_STATE => Message::VolumeState {
+                level: reader.level()?,
+                muted: reader.u8()? != 0,
+            },
+            VOLUME_UNAVAILABLE => Message::VolumeUnavailable,
+            BRIGHTNESS_SET => Message::BrightnessSet {
+                level: reader.level()?,
+                window: reader.u8()? != 0,
+            },
+            BRIGHTNESS_RELEASE => Message::BrightnessRelease,
+            BRIGHTNESS_STATE => Message::BrightnessState {
+                level: reader.level()?,
+            },
+            BRIGHTNESS_UNAVAILABLE => Message::BrightnessUnavailable,
             _ => return Err(Invalid("unknown kind")),
         };
         reader.end()?;
@@ -538,6 +946,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One record of each kind.
     fn records_round_trip() {
         for message in [
             Message::HapticsQuery,
@@ -591,10 +1000,58 @@ mod tests {
             Message::CredentialCancelled,
             Message::CredentialOpened,
             Message::CredentialClose { accepted: true },
+            Message::LocationStart,
+            Message::LocationStop,
+            Message::LocationFix(Fix {
+                latitude: 45.4642,
+                longitude: 9.19,
+                accuracy: 10.5,
+                altitude: Some(162.0),
+                speed: None,
+                heading: None,
+                vertical_accuracy: Some(7.0),
+                speed_accuracy: Some(0.47),
+                heading_accuracy: None,
+                time_ms: 1_795_000_000_000,
+                satellites: 11,
+            }),
+            Message::LocationSatellites(vec![Satellite {
+                constellation: Constellation::Glonass,
+                number: 18,
+                band: "G1".into(),
+                frequency: Some(1_600_312_500.0),
+                cn0: Some(19.6),
+                elevation: Some(38.5),
+                azimuth: None,
+                tracked: true,
+                used: true,
+                ephemeris: true,
+                almanac: false,
+            }]),
+            Message::VolumeSet {
+                level: 0.4,
+                muted: false,
+            },
+            Message::VolumeState {
+                level: 1.0,
+                muted: true,
+            },
+            Message::VolumeUnavailable,
+            Message::BrightnessSet {
+                level: 0.25,
+                window: true,
+            },
+            Message::BrightnessRelease,
+            Message::BrightnessState { level: 0.0 },
+            Message::BrightnessUnavailable,
         ]
         .into_iter()
         .chain(SCANS.map(Message::FingerprintScan))
-        {
+        .chain(ENGINES.map(|engine| Message::LocationState {
+            engine,
+            used: 7,
+            tracked: 19,
+        })) {
             assert_eq!(Message::decode(&message.encode()), Ok(message));
         }
     }
@@ -616,6 +1073,41 @@ mod tests {
             intensity: 1.5,
         }]);
         assert!(Message::decode(&loud.encode()).is_err());
+    }
+
+    #[test]
+    fn positions_off_the_globe_do_not_decode() {
+        let fix = Fix {
+            latitude: 91.0,
+            longitude: 0.0,
+            accuracy: 5.0,
+            altitude: None,
+            speed: None,
+            heading: None,
+            vertical_accuracy: None,
+            speed_accuracy: None,
+            heading_accuracy: None,
+            time_ms: 0,
+            satellites: 0,
+        };
+        assert!(Message::decode(&Message::LocationFix(fix).encode()).is_err());
+        let infinite = Fix {
+            latitude: 0.0,
+            altitude: Some(f64::INFINITY),
+            ..fix
+        };
+        assert!(Message::decode(&Message::LocationFix(infinite).encode()).is_err());
+    }
+
+    #[test]
+    fn levels_outside_their_range_do_not_decode() {
+        for level in [-0.1, 1.5, f32::NAN] {
+            let set = Message::BrightnessSet {
+                level,
+                window: false,
+            };
+            assert!(Message::decode(&set.encode()).is_err());
+        }
     }
 
     #[test]

@@ -13,12 +13,15 @@ mod imports;
 mod input;
 mod input_time;
 mod insets;
+mod keyboard_layout;
 mod layers;
 mod notifications;
 mod presentation_audit;
 mod readiness;
 mod resize;
+mod scroll;
 mod text_input;
+mod titles;
 mod toplevel_icon;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -49,6 +52,7 @@ use droidloom_window_policy::{LogicalSize, SessionMode, WindowPolicyPaths, Windo
 use gbm::{BufferObject, Device as GbmDevice, Modifier};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
+use smithay_client_toolkit::globals::ProvidesBoundGlobal;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::presentation_time::{
     PresentTime, PresentationTimeHandler, PresentationTimeState,
@@ -59,9 +63,7 @@ use smithay_client_toolkit::registry_handlers;
 use smithay_client_toolkit::seat::keyboard::{
     KeyEvent, KeyboardHandler, Modifiers, RawModifiers, RepeatInfo,
 };
-use smithay_client_toolkit::seat::pointer::{
-    AxisScroll, PointerEvent, PointerEventKind, PointerHandler,
-};
+use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
 use smithay_client_toolkit::seat::touch::TouchHandler;
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::WaylandSurface;
@@ -98,6 +100,10 @@ use wayland_protocols::wp::presentation_time::client::wp_presentation_feedback::
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
+use wayland_protocols::xdg::decoration::zv1::client::{
+    zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+    zxdg_toplevel_decoration_v1::{self, ZxdgToplevelDecorationV1},
+};
 use wayland_protocols_wlr::output_power_management::v1::client::{
     zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1,
     zwlr_output_power_v1::{self, ZwlrOutputPowerV1},
@@ -115,11 +121,6 @@ const SIDE_BUTTON: u32 = 0x113;
 const EXTRA_BUTTON: u32 = 0x114;
 const EVDEV_KEY_BACK: u32 = 158;
 const EVDEV_KEY_FORWARD: u32 = 159;
-const SCROLL_POINTER_ID: u32 = u32::MAX - 1;
-const SCROLL_IDLE_TIMEOUT: Duration = Duration::from_millis(85);
-const SCROLL_SLOP_LOGICAL: f64 = 9.0;
-const SCROLL_MIN_COMMIT_LOGICAL: f64 = 12.0;
-const SCROLL_EDGE_MARGIN: f64 = 16.0;
 const FRACTIONAL_SCALE_DENOMINATOR: u32 = 120;
 const MAX_BUFFER_DIMENSION: u32 = 16_384;
 
@@ -270,6 +271,9 @@ struct TaskWindow {
     input_route: Option<input::Route>,
     window: Option<Window>,
     toplevel_icon: Option<toplevel_icon::TaskIcon>,
+    /// Asks the compositor to draw the titlebar. Held here, not by SCTK, so it
+    /// can be destroyed before the toplevel as xdg-decoration requires.
+    decoration: Option<ZxdgToplevelDecorationV1>,
     viewport: Option<WpViewport>,
     fractional_scale: Option<WpFractionalScaleV1>,
     sync_surface: Option<WpLinuxDrmSyncobjSurfaceV1>,
@@ -304,6 +308,16 @@ struct TaskWindow {
     /// Held while a shown Android window has `FLAG_KEEP_SCREEN_ON`. Denial
     /// keeps its displays on only while this window is visible.
     idle_inhibitor: Option<ZwpIdleInhibitorV1>,
+    /// The Android window hid the status bar, and the toplevel asked to be
+    /// fullscreen. The compositor decides; this only avoids repeating.
+    fullscreen: bool,
+    /// Present while Android lays the window out around the on-screen
+    /// keyboard instead of the compositor moving it.
+    keyboard_inset: Option<insets::DenialKeyboardInsetV1>,
+    /// The keyboard's covered height in logical pixels, as last reported.
+    keyboard_logical: u32,
+    /// The covered height last sent to Android, in buffer pixels.
+    keyboard_sent: Option<u32>,
     unmap_requested: bool,
     closing: bool,
 }
@@ -352,14 +366,6 @@ impl Contact {
     }
 }
 
-#[derive(Clone, Copy)]
-struct ScrollGesture {
-    object: TaskObjectId,
-    virtual_pos: (f64, f64),
-    max_travel: f64,
-    deadline: Instant,
-}
-
 // A cancelled/replaced shared stream also invalidates contacts waiting behind
 // clipboard synchronization. Preserve keyboard events, which are independent.
 fn clear_contact_state(
@@ -378,6 +384,9 @@ struct App {
     clipboard: clipboard::Clipboard,
     clipboard_inputs: VecDeque<(TaskObjectId, InputEvent, u64)>,
     text_input: text_input::TextInput,
+    /// Android's hint for each group of the host keymap, and the active group.
+    keyboard_groups: Vec<keyboard_layout::Hint>,
+    keyboard_group: u32,
     registry_state: RegistryState,
     output_state: OutputState,
     output_power_manager: Option<ZwlrOutputPowerManagerV1>,
@@ -409,6 +418,7 @@ struct App {
     window_policy: WindowPolicyStore,
     /// The density each task gets on the output it is on.
     densities: density::Densities,
+    titles: titles::Titles,
     /// The task last given a density, and the density last sent for new tasks.
     density_task: Option<TaskObjectId>,
     new_task_density: Option<u32>,
@@ -420,7 +430,6 @@ struct App {
     touch: Option<wl_touch::WlTouch>,
     focused: Option<TaskObjectId>,
     pointer_contact: Option<Contact>,
-    scroll_gesture: Option<ScrollGesture>,
     pressed_nav_button: Option<(TaskObjectId, u32)>,
     touch_contacts: BTreeMap<i32, Contact>,
     // Touch and mouse share Android's injected pointer device; keys are separate.
@@ -659,6 +668,35 @@ impl App {
             .map(|(_, dpi)| dpi)
     }
 
+    /// Tells Android how much of the task the on-screen keyboard covers, in
+    /// the task's buffer pixels, when that changed.
+    fn update_task_keyboard_inset(&mut self, object: TaskObjectId) -> Result<(), PresenterError> {
+        let Some(task) = self.tasks.get(&object) else {
+            return Ok(());
+        };
+        if task.keyboard_inset.is_none() || task.closing || task.configure_serial == 0 {
+            return Ok(());
+        }
+        let height = u32::try_from(
+            (u64::from(task.keyboard_logical) * u64::from(task.applied_scale_120)
+                + u64::from(FRACTIONAL_SCALE_DENOMINATOR / 2))
+                / u64::from(FRACTIONAL_SCALE_DENOMINATOR),
+        )
+        .unwrap_or(u32::MAX)
+        .min(task.buffer_size.1);
+        if task.keyboard_sent == Some(height) {
+            return Ok(());
+        }
+        self.endpoint
+            .as_ref()
+            .ok_or(PresenterError::Configuration("endpoint disappeared"))?
+            .send_keyboard_inset(object, height)?;
+        if let Some(task) = self.tasks.get_mut(&object) {
+            task.keyboard_sent = Some(height);
+        }
+        Ok(())
+    }
+
     fn update_task_refresh(&mut self, object: TaskObjectId) -> Result<(), PresenterError> {
         if self.tasks.get(&object).is_none_or(|task| task.closing) {
             return Ok(());
@@ -870,57 +908,92 @@ impl App {
         }
         let mut app_id = package.to_owned();
         let mut toplevel_icon = None;
-        let (window, viewport, fractional_scale, sync_surface) = if headless {
-            (None, None, None, None)
-        } else {
-            let surface = self.compositor.create_surface(qh);
-            let decorations = match self.session_mode {
-                SessionMode::Desktop => WindowDecorations::RequestServer,
-                SessionMode::Mobile => WindowDecorations::None,
-            };
-            let window = self.xdg_shell.create_window(surface, decorations, qh);
-            let desktop = toplevel_icon::desktop_entry_for_package(package);
-            let title = desktop
-                .as_ref()
-                .and_then(|entry| entry.title.clone())
-                .unwrap_or_else(|| package.to_owned());
-            if let Some(entry) = &desktop {
-                app_id = entry.desktop_id.clone();
-            }
-            window.set_title(title);
-            window.set_app_id(app_id.clone());
-            window.set_min_size(Some((1, 1)));
-            if let Some(icon_name) = desktop.as_ref().and_then(|entry| entry.icon.as_deref()) {
-                toplevel_icon = self.toplevel_icon_manager.attach(
+        let (window, decoration, viewport, fractional_scale, sync_surface, keyboard_inset) =
+            if headless {
+                (None, None, None, None, None, None)
+            } else {
+                let surface = self.compositor.create_surface(qh);
+                // The compositor draws the titlebar that moves the window in
+                // desktop sessions: the whole surface belongs to the Android
+                // app. One without xdg-decoration leaves the window
+                // undecorated. The decoration is ours rather than SCTK's: SCTK
+                // destroys it only when its last Window clone drops, after we
+                // have destroyed the toplevel.
+                let window = self
+                    .xdg_shell
+                    .create_window(surface, WindowDecorations::None, qh);
+                let decoration = (self.session_mode == SessionMode::Desktop)
+                    .then(|| {
+                        ProvidesBoundGlobal::<ZxdgDecorationManagerV1, 1>::bound_global(
+                            &self.xdg_shell,
+                        )
+                        .ok()
+                        .map(|manager| {
+                            let decoration =
+                                manager.get_toplevel_decoration(window.xdg_toplevel(), qh, ());
+                            decoration.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
+                            decoration
+                        })
+                    })
+                    .flatten();
+                let desktop = toplevel_icon::desktop_entry_for_package(package);
+                let title = desktop
+                    .as_ref()
+                    .and_then(|entry| entry.title.clone())
+                    .unwrap_or_else(|| self.titles.title(package));
+                if let Some(entry) = &desktop {
+                    app_id = entry.desktop_id.clone();
+                }
+                window.set_title(title);
+                window.set_app_id(app_id.clone());
+                window.set_min_size(Some((1, 1)));
+                if let Some(icon_name) = desktop.as_ref().and_then(|entry| entry.icon.as_deref()) {
+                    toplevel_icon = self.toplevel_icon_manager.attach(
+                        qh,
+                        &self.layer_globals.shm,
+                        window.xdg_toplevel(),
+                        icon_name,
+                    );
+                }
+                if let Some(manager) = &self.insets_manager {
+                    manager.set_self_managed(window.wl_surface());
+                }
+                // Only when Android can take the keyboard's height; otherwise the
+                // compositor keeps moving the window clear of the keyboard.
+                let keyboard_inset = self
+                    .insets_manager
+                    .as_ref()
+                    .filter(|manager| manager.version() >= 2)
+                    .filter(|_| {
+                        self.endpoint
+                            .as_ref()
+                            .is_some_and(DenialEndpoint::keyboard_inset)
+                    })
+                    .map(|manager| manager.get_keyboard_inset(window.wl_surface(), qh, object));
+                // fractional-scale-v1 keeps the wl_surface at scale 1 and uses a
+                // viewport to map the higher-resolution buffer into XDG logical
+                // coordinates.
+                window.wl_surface().set_buffer_scale(1);
+                let viewport = self.viewporter.get_viewport(window.wl_surface(), qh, ());
+                let fractional_scale = self.fractional_scale_manager.get_fractional_scale(
+                    window.wl_surface(),
                     qh,
-                    &self.layer_globals.shm,
-                    window.xdg_toplevel(),
-                    icon_name,
+                    object,
                 );
-            }
-            if let Some(manager) = &self.insets_manager {
-                manager.set_self_managed(window.wl_surface());
-            }
-            // fractional-scale-v1 keeps the wl_surface at scale 1 and uses a
-            // viewport to map the higher-resolution buffer into XDG logical
-            // coordinates.
-            window.wl_surface().set_buffer_scale(1);
-            let viewport = self.viewporter.get_viewport(window.wl_surface(), qh, ());
-            let fractional_scale =
-                self.fractional_scale_manager
-                    .get_fractional_scale(window.wl_surface(), qh, object);
-            let sync_surface = self
-                .sync_manager
-                .as_ref()
-                .map(|manager| manager.get_surface(window.wl_surface(), qh, ()));
-            window.commit();
-            (
-                Some(window),
-                Some(viewport),
-                Some(fractional_scale),
-                sync_surface,
-            )
-        };
+                let sync_surface = self
+                    .sync_manager
+                    .as_ref()
+                    .map(|manager| manager.get_surface(window.wl_surface(), qh, ()));
+                window.commit();
+                (
+                    Some(window),
+                    decoration,
+                    Some(viewport),
+                    Some(fractional_scale),
+                    sync_surface,
+                    keyboard_inset,
+                )
+            };
         self.tasks.insert(
             object,
             TaskWindow {
@@ -936,6 +1009,7 @@ impl App {
                 input_route: None,
                 window,
                 toplevel_icon,
+                decoration,
                 viewport,
                 fractional_scale,
                 sync_surface,
@@ -962,6 +1036,10 @@ impl App {
                 suspended: false,
                 hide_due: None,
                 idle_inhibitor: None,
+                fullscreen: false,
+                keyboard_inset,
+                keyboard_logical: 0,
+                keyboard_sent: None,
                 unmap_requested: false,
                 closing: false,
             },
@@ -1078,6 +1156,7 @@ impl App {
             }
         }
         self.update_task_density(object)?;
+        self.update_task_keyboard_inset(object)?;
         self.endpoint
             .as_mut()
             .ok_or(PresenterError::Configuration("endpoint disappeared"))?
@@ -1706,6 +1785,10 @@ impl App {
         self.activation.remove(object);
         if let Some(mut task) = self.tasks.remove(&object) {
             task.timeline.stop();
+            // Before the Window drops and SCTK destroys the toplevel.
+            if let Some(decoration) = task.decoration.take() {
+                decoration.destroy();
+            }
             if let Some(fractional_scale) = task.fractional_scale.take() {
                 fractional_scale.destroy();
             }
@@ -1720,6 +1803,9 @@ impl App {
             }
             if let Some(toplevel_icon) = task.toplevel_icon.take() {
                 toplevel_icon.destroy();
+            }
+            if let Some(inset) = task.keyboard_inset.take() {
+                inset.destroy();
             }
             for (_, target) in task.targets {
                 if let Some(buffer) = target.wayland {
@@ -1775,12 +1861,19 @@ impl App {
         if let Some(toplevel_icon) = task.toplevel_icon.take() {
             toplevel_icon.destroy();
         }
+        if let Some(inset) = task.keyboard_inset.take() {
+            inset.destroy();
+        }
         // Window is reference counted by SCTK. Taking our handle below does
         // not guarantee that WindowInner is dropped here, so relying on Drop
         // can leave the compositor-side toplevel mapped until some unrelated
         // callback releases the final clone. The close request is terminal:
         // destroy the role explicitly and let the remaining surface/buffer
-        // objects drain independently.
+        // objects drain independently. xdg-decoration requires the
+        // decoration to go first; Smithay disconnects us otherwise.
+        if let Some(decoration) = task.decoration.take() {
+            decoration.destroy();
+        }
         if let Some(window) = task.window.as_ref() {
             window.xdg_toplevel().destroy();
         }
@@ -1923,6 +2016,25 @@ impl App {
                     window.xdg_toplevel().set_parent(parent.as_ref());
                 }
             }
+            EndpointAction::SetFullscreen { object, fullscreen } => {
+                // An immersive Android app hid its status bar: ask for the
+                // whole output, as a native fullscreen app would, and give it
+                // back when the app shows the bar again.
+                let task = self
+                    .tasks
+                    .get_mut(&object)
+                    .ok_or(PresenterError::UnknownTask(object))?;
+                if task.fullscreen != fullscreen
+                    && let Some(window) = task.window.as_ref().filter(|_| !task.closing)
+                {
+                    if fullscreen {
+                        window.set_fullscreen(None);
+                    } else {
+                        window.unset_fullscreen();
+                    }
+                    task.fullscreen = fullscreen;
+                }
+            }
             EndpointAction::RequestActivation { object } => {
                 if self.focused != Some(object)
                     && let Some(task) = self
@@ -2012,7 +2124,19 @@ impl App {
                     .with_lazy_render_targets()
                     .with_scene_presentation()
                     .with_task_density()
-                    .with_task_parents();
+                    .with_task_parents()
+                    .with_task_fullscreen();
+                // Only a compositor that reports its keyboard's height lets
+                // Android lay windows out around it.
+                let endpoint = if self
+                    .insets_manager
+                    .as_ref()
+                    .is_some_and(|manager| manager.version() >= 2)
+                {
+                    endpoint.with_task_keyboard_inset()
+                } else {
+                    endpoint
+                };
                 let endpoint = if self.idle_inhibit_manager.is_some() {
                     endpoint.with_keep_screen_on()
                 } else {
@@ -2066,13 +2190,11 @@ impl App {
         }
         self.focused = None;
         self.pointer_contact = None;
-        self.scroll_gesture = None;
         self.pressed_nav_button = None;
         self.touch_contacts.clear();
     }
 
     fn clear_contacts(&mut self) {
-        self.scroll_gesture = None;
         self.pressed_nav_button = None;
         clear_contact_state(
             &mut self.pointer_contact,
@@ -2107,9 +2229,6 @@ impl App {
                 .pointer_contact
                 .is_some_and(|contact| contact.object == object)
                 && !self
-                    .scroll_gesture
-                    .is_some_and(|scroll| scroll.object == object)
-                && !self
                     .touch_contacts
                     .values()
                     .any(|contact| contact.object == object)
@@ -2139,13 +2258,6 @@ impl App {
         } else if self.endpoint.is_some() {
             let mut contacts: Vec<_> = self.touch_contacts.values().copied().collect();
             contacts.extend(self.pointer_contact);
-            if let Some(scroll) = self.scroll_gesture {
-                contacts.push(Contact {
-                    object: scroll.object,
-                    pointer_id: SCROLL_POINTER_ID,
-                    position_fixed: self.fixed_position(scroll.object, scroll.virtual_pos),
-                });
-            }
             // Legacy policy groups by task. Every route needs retirement.
             contacts.sort_by_key(|contact| contact.object);
             contacts.dedup_by_key(|contact| contact.object);
@@ -2180,6 +2292,46 @@ impl App {
     /// Nanoseconds for a touch or mouse event the presenter makes itself.
     fn synthesized_time(&mut self) -> Result<u64, PresenterError> {
         Ok(self.motion_times.received(monotonic_timestamp_nanos()?))
+    }
+
+    /// Send one frame's wheel or touchpad scroll as Android's mouse scroll.
+    fn scroll(
+        &mut self,
+        object: TaskObjectId,
+        position: (f64, f64),
+        vertical: scroll::Axis,
+        horizontal: scroll::Axis,
+        millis: u32,
+    ) {
+        let Some(task) = self.tasks.get(&object) else {
+            return;
+        };
+        let scale = f64::from(task.applied_scale_120) / 120.0;
+        let dpi = task
+            .density_dpi
+            .filter(|dpi| *dpi != 0)
+            .map_or(density::DEFAULT_DPI_PER_SCALE * scale, f64::from);
+        let notch = scroll::notch_logical(dpi, task.applied_scale_120);
+        let (up, right) = scroll::android_notches(vertical, horizontal, notch);
+        let (vertical_fixed, horizontal_fixed) = (fixed_16_16(up), fixed_16_16(right));
+        if vertical_fixed == 0 && horizontal_fixed == 0 {
+            return;
+        }
+        let (x_fixed, y_fixed) = self.fixed_position(object, position);
+        let event = InputEvent::Scroll {
+            x_fixed,
+            y_fixed,
+            vertical_fixed,
+            horizontal_fixed,
+        };
+        let time = if millis == 0 {
+            self.synthesized_time()
+        } else {
+            self.input_time(input_time::Device::Pointer, millis)
+        };
+        if let Err(error) = time.and_then(|time| self.send_input(object, event, time)) {
+            self.fail(&error);
+        }
     }
 
     /// Send one event stamped with its hardware time on the shared monotonic clock.
@@ -2305,155 +2457,6 @@ impl App {
 
     fn hide_deadline(&self) -> Option<Instant> {
         self.tasks.values().filter_map(|task| task.hide_due).min()
-    }
-
-    fn scroll_deadline(&self) -> Option<Instant> {
-        self.scroll_gesture.map(|scroll| scroll.deadline)
-    }
-
-    fn expire_scroll(&mut self, now: Instant) -> Result<(), PresenterError> {
-        if self
-            .scroll_gesture
-            .is_some_and(|scroll| now >= scroll.deadline)
-        {
-            let timestamp = self.synthesized_time()?;
-            self.finish_scroll(true, timestamp)?;
-            self.pump_direct_input()?;
-        }
-        Ok(())
-    }
-
-    fn finish_scroll(&mut self, commit_up: bool, timestamp: u64) -> Result<(), PresenterError> {
-        let Some(scroll) = self.scroll_gesture.take() else {
-            return Ok(());
-        };
-        if !self.tasks.contains_key(&scroll.object) {
-            return Ok(());
-        }
-        let contact = Contact {
-            object: scroll.object,
-            pointer_id: SCROLL_POINTER_ID,
-            position_fixed: self.fixed_position(scroll.object, scroll.virtual_pos),
-        };
-        let action = if commit_up && scroll.max_travel >= SCROLL_MIN_COMMIT_LOGICAL {
-            TouchAction::Up
-        } else if self.pointer_contact.is_none() && self.touch_contacts.is_empty() {
-            TouchAction::Cancel
-        } else {
-            TouchAction::Up
-        };
-        self.send_input(scroll.object, contact.event(action), timestamp)?;
-        Ok(())
-    }
-
-    fn step_scroll(
-        &mut self,
-        object: TaskObjectId,
-        cursor: (f64, f64),
-        dx_scroll: f64,
-        dy_scroll: f64,
-        wheel: bool,
-        mut timestamp: u64,
-    ) -> Result<(), PresenterError> {
-        if self.pointer_contact.is_some() || !self.touch_contacts.is_empty() {
-            return Ok(());
-        }
-        let Some((logical_w, logical_h)) = self.tasks.get(&object).and_then(|t| t.logical_size)
-        else {
-            return Ok(());
-        };
-        if logical_w < 4 || logical_h < 4 {
-            return Ok(());
-        }
-        let (finger_dx, finger_dy) = (-dx_scroll, -dy_scroll);
-        let hypot = finger_dx.hypot(finger_dy);
-        if hypot < 0.01 {
-            return Ok(());
-        }
-        let (w, h) = (f64::from(logical_w), f64::from(logical_h));
-        let (mx, my) = (SCROLL_EDGE_MARGIN.min(w * 0.25), SCROLL_EDGE_MARGIN.min(h * 0.25));
-        if let Some(scroll) = self.scroll_gesture {
-            let next_x = scroll.virtual_pos.0 + finger_dx;
-            let next_y = scroll.virtual_pos.1 + finger_dy;
-            if scroll.object != object
-                || next_x < mx
-                || next_x > w - mx
-                || next_y < my
-                || next_y > h - my
-            {
-                self.finish_scroll(false, timestamp)?;
-                timestamp = timestamp.saturating_add(1);
-            }
-        }
-        if self.scroll_gesture.is_none() {
-            let anchor = scroll_anchor(cursor, (finger_dx, finger_dy), (w, h), (mx, my));
-            let down = Contact {
-                object,
-                pointer_id: SCROLL_POINTER_ID,
-                position_fixed: self.fixed_position(object, anchor),
-            };
-            if !self.send_input(object, down.event(TouchAction::Down), timestamp)? {
-                return Ok(());
-            }
-            let slop_dx = finger_dx / hypot * SCROLL_SLOP_LOGICAL;
-            let slop_dy = finger_dy / hypot * SCROLL_SLOP_LOGICAL;
-            let slop_pos = (
-                (anchor.0 + slop_dx).clamp(1.0, (w - 1.0).max(1.0)),
-                (anchor.1 + slop_dy).clamp(1.0, (h - 1.0).max(1.0)),
-            );
-            let slop_contact = Contact {
-                object,
-                pointer_id: SCROLL_POINTER_ID,
-                position_fixed: self.fixed_position(object, slop_pos),
-            };
-            timestamp = timestamp.saturating_add(1);
-            if !self.send_input(object, slop_contact.event(TouchAction::Motion), timestamp)? {
-                return Ok(());
-            }
-            self.scroll_gesture = Some(ScrollGesture {
-                object,
-                virtual_pos: slop_pos,
-                max_travel: slop_dx.hypot(slop_dy),
-                deadline: Instant::now() + SCROLL_IDLE_TIMEOUT,
-            });
-        }
-        let Some(scroll) = self.scroll_gesture else {
-            return Ok(());
-        };
-        let target_x = (scroll.virtual_pos.0 + finger_dx).clamp(1.0, (w - 1.0).max(1.0));
-        let target_y = (scroll.virtual_pos.1 + finger_dy).clamp(1.0, (h - 1.0).max(1.0));
-        if wheel {
-            let mid = (
-                0.5 * (scroll.virtual_pos.0 + target_x),
-                0.5 * (scroll.virtual_pos.1 + target_y),
-            );
-            let mid_contact = Contact {
-                object,
-                pointer_id: SCROLL_POINTER_ID,
-                position_fixed: self.fixed_position(object, mid),
-            };
-            timestamp = timestamp.saturating_add(1);
-            if !self.send_input(object, mid_contact.event(TouchAction::Motion), timestamp)? {
-                return Ok(());
-            }
-        }
-        let end_pos = (target_x, target_y);
-        let end_contact = Contact {
-            object,
-            pointer_id: SCROLL_POINTER_ID,
-            position_fixed: self.fixed_position(object, end_pos),
-        };
-        timestamp = timestamp.saturating_add(1);
-        if self.send_input(object, end_contact.event(TouchAction::Motion), timestamp)?
-            && let Some(active) = self.scroll_gesture.as_mut()
-        {
-            let step_hypot = (end_pos.0 - active.virtual_pos.0)
-                .hypot(end_pos.1 - active.virtual_pos.1);
-            active.virtual_pos = end_pos;
-            active.max_travel += step_hypot;
-            active.deadline = Instant::now() + SCROLL_IDLE_TIMEOUT;
-        }
-        Ok(())
     }
 
     fn send_nav_key(
@@ -2620,6 +2623,28 @@ impl CompositorHandler for App {
         }
         if let Err(error) = self.update_task_refresh(object) {
             self.fail(&error);
+        }
+    }
+}
+
+impl Dispatch<insets::DenialKeyboardInsetV1, TaskObjectId> for App {
+    fn event(
+        state: &mut Self,
+        _proxy: &insets::DenialKeyboardInsetV1,
+        event: insets::denial_keyboard_inset_v1::Event,
+        object: &TaskObjectId,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // Android takes the settled height when the motion starts; the
+        // motion's duration is not forwarded.
+        let insets::denial_keyboard_inset_v1::Event::Inset { height, .. } = event;
+        let Some(task) = state.tasks.get_mut(object) else {
+            return;
+        };
+        task.keyboard_logical = height;
+        if let Err(error) = state.update_task_keyboard_inset(*object) {
+            state.fail(&error);
         }
     }
 }
@@ -3366,8 +3391,27 @@ impl KeyboardHandler for App {
         _serial: u32,
         _modifiers: Modifiers,
         _raw_modifiers: RawModifiers,
-        _layout: u32,
+        layout: u32,
     ) {
+        // The active group: switching layouts on the host switches Android's.
+        self.keyboard_group = layout;
+        let hint = self.keyboard_groups.get(layout as usize).copied();
+        self.text_input.set_keyboard_layout(hint);
+    }
+
+    fn update_keymap(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        keymap: smithay_client_toolkit::seat::keyboard::Keymap<'_>,
+    ) {
+        self.keyboard_groups = keyboard_layout::groups(&keymap.as_string());
+        let hint = self
+            .keyboard_groups
+            .get(self.keyboard_group as usize)
+            .copied();
+        self.text_input.set_keyboard_layout(hint);
     }
 
     fn update_repeat_info(
@@ -3391,6 +3435,10 @@ impl PointerHandler for App {
         if self.pointer.as_ref() != Some(_pointer) {
             return;
         }
+        // A frame's axis events are one scroll: its fields repeat one motion.
+        let mut scrolled = None;
+        let (mut vertical, mut horizontal) = (scroll::Axis::default(), scroll::Axis::default());
+        let mut scroll_time = 0;
         for event in events {
             if let PointerEventKind::Press { serial, .. } = event.kind
                 && let Some(data) =
@@ -3406,14 +3454,6 @@ impl PointerHandler for App {
             let object = self.task_for_surface(&event.surface);
             match event.kind {
                 PointerEventKind::Press { button, time, .. } if button == LEFT_BUTTON => {
-                    if self.scroll_gesture.is_some()
-                        && let Err(error) = self
-                            .synthesized_time()
-                            .and_then(|ts| self.finish_scroll(false, ts))
-                    {
-                        self.fail(&error);
-                        return;
-                    }
                     if self.pointer_contact.is_some() {
                         self.retire_contacts(None);
                     }
@@ -3507,61 +3547,25 @@ impl PointerHandler for App {
                 }
                 PointerEventKind::Axis {
                     time,
-                    horizontal,
-                    vertical,
-                    source,
+                    horizontal: across,
+                    vertical: down,
+                    ..
                 } => {
-                    let wheel = matches!(
-                        source,
-                        Some(
-                            wl_pointer::AxisSource::Wheel | wl_pointer::AxisSource::WheelTilt
-                        )
-                    );
-                    let dx = axis_delta(horizontal, wheel);
-                    let dy = axis_delta(vertical, wheel);
-                    let stops = horizontal.stop || vertical.stop;
-                    if (dx.abs() >= 0.01 || dy.abs() >= 0.01) || (stops && self.scroll_gesture.is_some()) {
-                        let ts = if time != 0 {
-                            self.input_time(input_time::Device::Pointer, time)
-                        } else {
-                            self.synthesized_time()
-                        };
-                        let result = ts.and_then(|mut timestamp| {
-                            if let Some(object) = object
-                                && (dx.abs() >= 0.01 || dy.abs() >= 0.01)
-                            {
-                                self.step_scroll(
-                                    object,
-                                    event.position,
-                                    dx,
-                                    dy,
-                                    wheel,
-                                    timestamp,
-                                )?;
-                                timestamp = timestamp.saturating_add(4);
-                            }
-                            if stops {
-                                self.finish_scroll(true, timestamp)?;
-                            }
-                            Ok(())
-                        });
-                        if let Err(error) = result {
-                            self.fail(&error);
-                        }
-                    }
+                    let Some(object) = object else { continue };
+                    vertical.add(&down);
+                    horizontal.add(&across);
+                    // Value120 and discrete steps arrive with time 0.
+                    scroll_time = scroll_time.max(time);
+                    scrolled = Some((object, event.position));
                 }
                 PointerEventKind::Leave { .. } => {
                     self.pressed_nav_button = None;
-                    if self.scroll_gesture.is_some()
-                        && let Err(error) = self
-                            .synthesized_time()
-                            .and_then(|ts| self.finish_scroll(true, ts))
-                    {
-                        self.fail(&error);
-                    }
                 }
                 _ => {}
             }
+        }
+        if let Some((object, position)) = scrolled {
+            self.scroll(object, position, vertical, horizontal, scroll_time);
         }
     }
 }
@@ -3579,14 +3583,6 @@ impl TouchHandler for App {
         position: (f64, f64),
     ) {
         if self.touch.as_ref() != Some(_touch) {
-            return;
-        }
-        if self.scroll_gesture.is_some()
-            && let Err(error) = self
-                .synthesized_time()
-                .and_then(|ts| self.finish_scroll(false, ts))
-        {
-            self.fail(&error);
             return;
         }
         if id < 0 || self.touch_contacts.contains_key(&id) {
@@ -3733,6 +3729,7 @@ wayland_client::delegate_noop!(App: ignore WpViewport);
 wayland_client::delegate_noop!(App: ignore ZwlrOutputPowerManagerV1);
 wayland_client::delegate_noop!(App: ignore ZwpIdleInhibitManagerV1);
 wayland_client::delegate_noop!(App: ignore ZwpIdleInhibitorV1);
+wayland_client::delegate_noop!(App: ignore ZxdgToplevelDecorationV1);
 
 fn main() {
     eprintln!("DROIDLOOM_DIRECT_INPUT_ABI=1;");
@@ -3849,6 +3846,8 @@ fn run() -> Result<(), PresenterError> {
             socket_path.with_file_name("text-input.sock"),
             globals.bind(&qh, 1..=1, ()).ok(),
         )?,
+        keyboard_groups: Vec::new(),
+        keyboard_group: 0,
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
         output_power_manager,
@@ -3864,7 +3863,7 @@ fn run() -> Result<(), PresenterError> {
         compositor,
         xdg_shell,
         toplevel_icon_manager: toplevel_icon::Manager::bind(&globals, &qh),
-        insets_manager: globals.bind(&qh, 1..=1, ()).ok(),
+        insets_manager: globals.bind(&qh, 1..=2, ()).ok(),
         frame_timeline_manager: globals.bind(&qh, 1..=1, ()).ok(),
         clock: clock::Clock::new(),
         viewporter,
@@ -3877,6 +3876,7 @@ fn run() -> Result<(), PresenterError> {
         session_mode,
         window_policy,
         densities: density::Densities::load(env::var_os("XDG_CONFIG_HOME"), env::var_os("HOME")),
+        titles: titles::Titles::new(env::var_os("XDG_DATA_HOME"), env::var_os("HOME")),
         density_task: None,
         new_task_density: None,
         endpoint: None,
@@ -3887,7 +3887,6 @@ fn run() -> Result<(), PresenterError> {
         touch: None,
         focused: None,
         pointer_contact: None,
-        scroll_gesture: None,
         pressed_nav_button: None,
         touch_contacts: BTreeMap::new(),
         motion_times: input_time::Stream::default(),
@@ -3996,11 +3995,9 @@ fn poll_sources(
     let now = Instant::now();
     app.report_stalled_scenes(now);
     app.hide_overdue(now)?;
-    app.expire_scroll(now)?;
     let fallback_deadline = app.task_work.deadline(now, RELEASE_POLL_FALLBACK);
     let stall_deadline = app.stalled_scene_deadline();
     let hide_deadline = app.hide_deadline();
-    let scroll_deadline = app.scroll_deadline();
     // Pending Wayland events must be dispatched before sleeping. The previous
     // fixed timeout masked a missed wakeup here when the socket was drained
     // by another reader but our event queue still contained callbacks.
@@ -4101,7 +4098,6 @@ fn poll_sources(
         .chain(fallback_deadline)
         .chain(stall_deadline)
         .chain(hide_deadline)
-        .chain(scroll_deadline)
         .min();
     let timeout = if app.task_work.pending() {
         0 // Flush Wayland first, then service work queued during this turn.
@@ -4453,43 +4449,6 @@ fn aggregate_display_power(states: impl IntoIterator<Item = Option<bool>>) -> Op
     (saw_output && !unknown).then_some(false)
 }
 
-fn axis_delta(axis: AxisScroll, wheel: bool) -> f64 {
-    if wheel {
-        if axis.value120 != 0 {
-            f64::from(axis.value120) / 120.0 * 56.0
-        } else if axis.discrete != 0 {
-            f64::from(axis.discrete) * 56.0
-        } else {
-            axis.absolute * 3.5
-        }
-    } else if axis.absolute != 0.0 {
-        axis.absolute * 1.4
-    } else if axis.value120 != 0 {
-        f64::from(axis.value120) / 120.0 * 56.0
-    } else {
-        0.0
-    }
-}
-
-fn scroll_anchor(
-    cursor: (f64, f64),
-    delta: (f64, f64),
-    size: (f64, f64),
-    margin: (f64, f64),
-) -> (f64, f64) {
-    let mut x = cursor.0.clamp(margin.0, (size.0 - margin.0).max(margin.0));
-    let mut y = cursor.1.clamp(margin.1, (size.1 - margin.1).max(margin.1));
-    let needed_x = delta.0.abs() + SCROLL_SLOP_LOGICAL + margin.0;
-    let needed_y = delta.1.abs() + SCROLL_SLOP_LOGICAL + margin.1;
-    if (delta.0 < -0.01 && x < needed_x) || (delta.0 > 0.01 && x + needed_x > size.0) {
-        x = (size.0 * 0.5).clamp(margin.0, (size.0 - margin.0).max(margin.0));
-    }
-    if (delta.1 < -0.01 && y < needed_y) || (delta.1 > 0.01 && y + needed_y > size.1) {
-        y = (size.1 * 0.5).clamp(margin.1, (size.1 - margin.1).max(margin.1));
-    }
-    (x, y)
-}
-
 #[cfg(test)]
 mod output_power_test;
 
@@ -4703,28 +4662,5 @@ mod tests {
         assert_eq!(presentation_refresh_period(0, 120_000).unwrap(), 8_333_333);
         assert!(presentation_timestamp_nanos(0, 1_000_000_000).is_err());
         assert!(presentation_refresh_period(0, 0).is_err());
-    }
-
-    #[test]
-    fn scroll_axis_delta_handles_touchpad_and_wheel_units() {
-        let touchpad = AxisScroll {
-            absolute: 12.5,
-            ..AxisScroll::default()
-        };
-        assert!((axis_delta(touchpad, false) - 17.5).abs() < 1e-6);
-
-        let hires_wheel = AxisScroll {
-            value120: 120,
-            discrete: 1,
-            absolute: 15.0,
-            ..AxisScroll::default()
-        };
-        assert!((axis_delta(hires_wheel, true) - 56.0).abs() < 1e-6);
-
-        let discrete_wheel = AxisScroll {
-            discrete: -2,
-            ..AxisScroll::default()
-        };
-        assert!((axis_delta(discrete_wheel, true) + 112.0).abs() < 1e-6);
     }
 }

@@ -464,6 +464,15 @@ pub fn prepare_fedora_stage(
 ) -> Result<()> {
     install_tree(&payload.join("runtime"), stage_runtime)?;
     install_tree(&payload.join("image"), stage_image)?;
+    // Upstream package-stage splits system/system_ext/product partitions into
+    // payload/base; merge them back into the single Fedora droidloom-image RPM.
+    let base_images = payload.join("base/usr/lib/droidloom/images/images");
+    if base_images.is_dir() {
+        install_tree(
+            &base_images,
+            &stage_image.join("usr/lib/droidloom/images/images"),
+        )?;
+    }
 
     let alpm_hooks = stage_runtime.join("usr/share/libalpm");
     if alpm_hooks.exists() {
@@ -577,6 +586,17 @@ mod tests {
         )
         .unwrap();
         fs::create_dir_all(img.join("usr/lib/droidloom/runtime/compat")).unwrap();
+        fs::create_dir_all(img.join("usr/lib/droidloom/images/images")).unwrap();
+        fs::write(
+            img.join("usr/lib/droidloom/images/images/vendor.raw.img"),
+            b"vendor",
+        )
+        .unwrap();
+        let base_images = payload.join("base/usr/lib/droidloom/images/images");
+        fs::create_dir_all(&base_images).unwrap();
+        for name in ["product.img", "system.img", "system_ext.img"] {
+            fs::write(base_images.join(name), name.as_bytes()).unwrap();
+        }
 
         let stage_runtime = temp.path().join("stage-runtime");
         let stage_image = temp.path().join("stage-image");
@@ -589,6 +609,15 @@ mod tests {
         assert!(stage_runtime.join("usr/lib/firewalld/policies/droidloom-egress.xml").is_file());
         assert!(!stage_runtime.join("usr/lib/droidloom/fedora-init.rc").exists());
         assert!(!stage_runtime.join("usr/lib/droidloom/fedora-vendor-build.prop").exists());
+        for name in ["vendor.raw.img", "product.img", "system.img", "system_ext.img"] {
+            assert!(
+                stage_image
+                    .join("usr/lib/droidloom/images/images")
+                    .join(name)
+                    .is_file(),
+                "missing merged partition image {name}"
+            );
+        }
     }
 
     #[test]

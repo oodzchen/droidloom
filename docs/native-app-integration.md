@@ -4,7 +4,7 @@ Status: architecture proposal with the PhoneWindowManager replacement,
 authoritative task publication, direct host window controls and native input
 reception inside InputFlinger implemented in the checkout. The broader
 integrations below remain proposed work, not preview guarantees. Existing released behavior is documented in
-[desktop integration](desktop-integration.md) and [known issues](KNOWN_ISSUES.md).
+[desktop integration](desktop-integration.md).
 
 ## Implementation status
 
@@ -68,7 +68,7 @@ coalesces obsolete sizes/focus transitions and retains commands until acknowledg
 Close supersedes its window's pending work; reconnects retry unacknowledged
 commands against their original object identity. Idle subscriptions sleep until
 an event. Host-originated focus changes do not echo activation requests back to
-the compositor. Paired task-backend ABI 4 metadata rejects old/new mixtures.
+the compositor. Paired task-backend ABI 5 metadata rejects old/new mixtures.
 
 Keep screen on follows Android: a shown window with `FLAG_KEEP_SCREEN_ON` keeps
 the screen on, here per task. Surface placement of the default display reports
@@ -91,6 +91,15 @@ can hand its answer back, as Play Protect's confirmation does when it asks
 for the device credential. A task with a parent draws its layers over a clear
 root instead of the dark backing, so a host that draws the parent beneath it
 shows the app through the dialog's dim.
+
+An app that hides the status bar, as an immersive game does with
+`WindowInsetsController.hide(statusBars())` or `FLAG_FULLSCREEN`, asks for the
+whole screen. The task's main window carries that request to system_server,
+which republishes the task when it changes (task-control 3.6). Composer sends
+`SetFullscreen` (protocol 1.13, capability `TASK_FULLSCREEN`), and the
+presenter calls `xdg_toplevel.set_fullscreen`, or `unset_fullscreen` once the
+app shows the bar again. The compositor decides what fullscreen means there,
+such as hiding its own status bar over the window.
 
 Task destruction has two phases: request host window destruction once, retaining
 the binding to route the displayed frame's final buffer release; then remove the
@@ -416,8 +425,10 @@ fallback can remain useful where the direct path is unavailable.
 
 The existing [audio bridge](audio-integration-proposal.md) remains the baseline
 for comparison. Physical routing stays with PipeWire and its session manager.
-An Android volume or mute operation must not silently change unrelated Linux
-applications. See [AOSP audio architecture](https://source.android.com/docs/core/audio).
+Android's media volume is the host's default output volume, as a native
+player's volume control is: an app that changes it changes the host's
+([runtime layout](contracts/runtime-layout-v1.md), "Media volume and screen
+brightness"). Android's master volume and mute stay on Droidloom's own PCM. See [AOSP audio architecture](https://source.android.com/docs/core/audio).
 
 ## Shared identity and independent service lifetimes
 
@@ -548,7 +559,10 @@ are no duplicate bars or inaccessible content edges.
 Reflect output changes, available work area, scale and orientation through
 Android configuration and real layout. Each task gets the density of the output
 it is on as a task configuration override (see the architecture's refresh and
-density section). Use host-provided insets where supported
+density section). Where the compositor reports its on-screen keyboard's height
+per window, Android lays the task out around it as around its own keyboard
+(see the architecture's on-screen keyboard section); elsewhere the compositor
+moves the window. Use host-provided insets where supported
 and keep an explicit fallback elsewhere. The current
 [fixed inset policy](contracts/navigation-insets.md) is a baseline, not the final
 desktop geometry contract.
@@ -613,8 +627,8 @@ authentication tokens or hardware attestation.
 Complete host IME integration with cursor rectangles, selection, supported
 surrounding-text context and editor actions. Preserve sensitive-field policy,
 Unicode boundaries, composition and session generation checks. Deliver real
-mouse buttons, hover, wheel scrolling and pointer shapes when the Android app
-supports them. Preserve compositor shortcuts and Android key semantics rather
+mouse buttons, hover and pointer shapes when the Android app supports them;
+wheel and touchpad scrolling already arrive as Android's mouse scroll. Preserve compositor shortcuts and Android key semantics rather
 than globally rewriting keys such as Escape or Ctrl. The
 [text-input contract](contracts/text-input-v1.md) records the current baseline.
 

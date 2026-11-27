@@ -222,6 +222,10 @@ fn host_presentation_is_ordinary_wayland_without_plugin_artifacts() {
     let cell_service = fs::read_to_string(root.join("packaging/systemd/system/droidloomd.service"))
         .expect("read cell service");
     assert!(cell_service.contains("OOMPolicy=continue"));
+    // netd's cgroup BPF attaches fail on a group the host has programs on
+    // (droidloom#15).
+    assert!(cell_service.contains("Delegate=memory pids"));
+    assert!(cell_service.contains("DelegateSubgroup=supervisor"));
 
     let catalog_service =
         fs::read_to_string(root.join("packaging/systemd/user/droidloom-applications.service"))
@@ -259,6 +263,24 @@ fn shared_kernel_vintf_reports_the_real_kernel_policy_version() {
 }
 
 #[test]
+fn every_cell_hides_su() {
+    // /system/xbin holds only the debug image's su and its adb remount
+    // helper; apps that find su refuse to run (droidloom#33).
+    let root = repository_root();
+    for recipe in ["cell-spec-x86_64-u1000.json", "cell-spec-arm64.json"] {
+        let spec = json(&root.join("packaging").join(recipe));
+        let overrides = spec["android_file_overrides"].as_array().unwrap();
+        assert!(
+            overrides.iter().any(|entry| {
+                entry["source"] == "/usr/lib/droidloom/current/compat/no-su"
+                    && entry["target"] == "/system/xbin"
+            }),
+            "{recipe} leaves /system/xbin/su visible"
+        );
+    }
+}
+
+#[test]
 fn android_vendor_build_uses_the_safe_rust_composer_core() {
     let android_bp =
         fs::read_to_string(repository_root().join("Android.bp")).expect("read Android.bp");
@@ -288,9 +310,11 @@ fn android_vendor_build_uses_the_safe_rust_composer_core() {
     assert!(android_bp.contains("crate_root: \"android/gpu/droidloom-vulkan/src/lib.rs\""));
     // Five shared transport/codec crates also build platform variants for WMS
     // and its native input receiver. The haptics, camera and authentication
-    // HALs add the device protocol, their libraries and their services; Wi-Fi
-    // adds the supplicant.
-    assert_eq!(android_bp.matches("vendor: true").count(), 25);
+    // HALs add the device protocol, their libraries and their services; the
+    // GNSS HAL its service; Wi-Fi adds the supplicant.
+    assert_eq!(android_bp.matches("vendor: true").count(), 26);
+    assert!(android_bp.contains("name: \"android.hardware.gnss-service.droidloom\""));
+    assert!(android_bp.contains("\"android.hardware.gnss-V7-rust\""));
     assert!(android_bp.contains("name: \"android.hardware.wifi.supplicant-service.droidloom\""));
     assert!(android_bp.contains("name: \"droidloom-wificond\""));
 
@@ -304,6 +328,8 @@ fn android_vendor_build_uses_the_safe_rust_composer_core() {
     assert!(product.contains("droidloom-classpath-wrapper"));
     // Hint sessions only help when HWUI opens them and the HAL acts on them.
     assert!(product.contains("android.hardware.power-service.droidloom"));
+    // The GPS feature the cell declares needs a GNSS HAL behind it.
+    assert!(product.contains("android.hardware.gnss-service.droidloom"));
     assert!(!product.contains("android.hardware.power-service.example"));
     assert!(product.contains("debug.hwui.use_hint_manager=true"));
     // Android reaches the host over Wi-Fi, not Ethernet.

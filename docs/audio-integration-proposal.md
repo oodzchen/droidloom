@@ -16,7 +16,9 @@ HAL. Its PCM16, 48 kHz BUS streams use four dedicated size-sealed memfds; output
 FMQ transactions copy directly into the acquired pool slot, and input copies
 directly from that slot into FMQ. Capture grants use read-only descriptors.
 The broker registers those same allocations with PipeWire's application-buffer
-API and performs no PCM copy. Mute and master volume affect only Droidloom PCM.
+API and performs no PCM copy. Android's master volume and mute affect only
+Droidloom PCM; its media volume is the host's output volume (see the runtime
+layout contract).
 
 Playback remains clocked when no host sink exists: PipeWire's dummy driver
 paces the stream, while WirePlumber's `node.linger` policy waits for an output
@@ -121,12 +123,17 @@ The user confirmed that the final build sounds good and considers playback
 resolved. This confirms acceptable audible latency and clear playback on the
 tested Bluetooth route; physical end-to-end latency has not been measured.
 
-Microphone capture defaults to denied. A host-user grant can be configured in
-`~/.config/droidloom/audio.env` with `DROIDLOOM_AUDIO_CAPTURE=1`. Removing the grant
-and restarting `droidloom-audio.service` stops existing capture and invalidates
-its generation. Reopening the Android recording stream obtains the new policy.
-Android's app permission checks remain in force. This grant applies to the cell,
-not individual Android apps. Missing endpoints and denied capture retain the
+Microphone capture is on by default, as on a phone: Android's own per-app
+microphone permission asks the user the first time an app records, and the
+desktop shows the broker's PipeWire recording stream like any other. To keep
+the whole cell off the microphone, set `DROIDLOOM_AUDIO_CAPTURE=0` in
+`~/.config/droidloom/audio.env` and restart `droidloom-audio.service`; that stops
+existing capture and invalidates its generation, and reopening the Android
+recording stream obtains the new policy. This switch applies to the cell, not
+to individual Android apps. Android records only from microphone device types,
+so the host input is declared as a built-in microphone; as a BUS input, every
+recording failed in the policy engine before reaching the HAL.
+Missing endpoints and denied capture retain the
 timed stub; fallback input is explicitly zero-filled, replacing upstream random
 bytes. Transport failures after opening a live stream terminate that stream.
 
@@ -203,7 +210,7 @@ The table describes the baseline before the implementation above.
 | Component | Present | Missing for real audio |
 | --- | --- | --- |
 | Android service | Vendor audio APEX, init services and VINTF audio core/effect V4 declarations | Host-backed `IModule/default` input/output stream implementation |
-| Android policy | 48 kHz PCM16 stereo output and mono input, using BUS endpoints | Operational host routes, microphone description, availability and permission handling |
+| Android policy | 48 kHz PCM16 stereo BUS output and mono built-in microphone input | Operational host routes, microphone description, availability and permission handling |
 | Sample processing | Upstream primary HAL, patched to select its stub for current BUS types | Playback delivery and real capture; the upstream stub discards output and generates synthetic input bytes |
 | Host backend | Architectural proposal | Rust per-user PipeWire service, graph negotiation and stream lifecycle |
 | Cell transport | Graphics FD-passing infrastructure | Audio-specific protocol, endpoint delegation, bounded buffers and ownership transitions |
@@ -322,9 +329,11 @@ target; general app-to-speaker zero-copy is not an established capability.
   bus outside the cell. Microphone grants must be revocable on the host; stop
   capture and invalidate the old pool on revocation. Disabling an endpoint
   cannot erase samples Android already received.
-- Map Android volume/mute to its own streams. Let host session policy choose
+- Android's music volume and mute are the host's default output volume
+  (see the runtime layout contract, "Media volume and screen brightness");
+  other Android streams keep their own volume. Let host session policy choose
   devices and reflect route loss, headset/Bluetooth transitions and capture
-  availability back into Android. Avoid changing global host mute/volume.
+  availability back into Android.
   HAL mix streams do not automatically provide per-Android-app controls or
   trustworthy microphone attribution; that requires framework identity work.
   [PipeWire session policy](https://docs.pipewire.org/page_session_manager.html),

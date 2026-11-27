@@ -40,12 +40,12 @@ fn main() {
         .expect("input compatibility marker is ASCII");
     if std::env::args().any(|arg| arg == "--compatibility") {
         println!(
-            "{compatibility} DROIDLOOM_TASK_BACKEND_ABI=4; DROIDLOOM_DIRECT_INPUT_ABI=1; DROIDLOOM_NATIVE_INPUT_ABI=2;"
+            "{compatibility} DROIDLOOM_TASK_BACKEND_ABI=5; DROIDLOOM_DIRECT_INPUT_ABI=1; DROIDLOOM_NATIVE_INPUT_ABI=2;"
         );
         return;
     }
     eprintln!(
-        "Droidloom Composer {compatibility} DROIDLOOM_TASK_BACKEND_ABI=4; DROIDLOOM_DIRECT_INPUT_ABI=1; DROIDLOOM_NATIVE_INPUT_ABI=2;"
+        "Droidloom Composer {compatibility} DROIDLOOM_TASK_BACKEND_ABI=5; DROIDLOOM_DIRECT_INPUT_ABI=1; DROIDLOOM_NATIVE_INPUT_ABI=2;"
     );
     if let Err(error) = run() {
         eprintln!("Droidloom Composer fatal: {error}");
@@ -74,7 +74,8 @@ fn run() -> Result<(), String> {
         .with_activation_requests(capabilities & capability::TASK_ACTIVATION != 0)
         .with_lazy_render_targets(capabilities & capability::LAZY_RENDER_TARGETS != 0)
         .with_keep_screen_on(capabilities & capability::KEEP_SCREEN_ON != 0)
-        .with_task_parents(capabilities & capability::TASK_PARENTS != 0);
+        .with_task_parents(capabilities & capability::TASK_PARENTS != 0)
+        .with_task_fullscreen(capabilities & capability::TASK_FULLSCREEN != 0);
     let session: SharedSession = Arc::new(Mutex::new(Session::default()));
     let factory_sink = sink.clone();
     let service = ComposerService::new(
@@ -177,7 +178,9 @@ fn handshake(socket: &ProtocolSocket) -> Result<u64, String> {
                     | capability::HOST_CLOCK
                     | capability::KEEP_SCREEN_ON
                     | capability::TASK_DENSITY
-                    | capability::TASK_PARENTS,
+                    | capability::TASK_PARENTS
+                    | capability::TASK_FULLSCREEN
+                    | capability::TASK_KEYBOARD_INSET,
             },
             &[],
         )
@@ -388,6 +391,19 @@ fn dispatch_event(
                 eprintln!("Droidloom deferred the density of new tasks: {error}");
             }
         }
+        AppliedDenialEvent::KeyboardInset { height } => {
+            if coordinator.is_direct_task(object) {
+                if let Err(error) = coordinator.queue_window_command(
+                    object,
+                    droidloom_task_control::TaskAction::KeyboardInset { height },
+                ) {
+                    eprintln!(
+                        "Droidloom deferred Android object {} keyboard inset: {error}",
+                        object.0
+                    );
+                }
+            }
+        }
         AppliedDenialEvent::Visibility {
             visibility,
             focused,
@@ -444,6 +460,7 @@ fn task_object(message: &DenialMessage) -> Option<TaskObjectId> {
         | DenialMessage::Configure { object, .. }
         | DenialMessage::Insets { object, .. }
         | DenialMessage::Density { object, .. }
+        | DenialMessage::KeyboardInset { object, .. }
         | DenialMessage::Visibility { object, .. }
         | DenialMessage::Close { object }
         | DenialMessage::BufferReleased { object, .. }

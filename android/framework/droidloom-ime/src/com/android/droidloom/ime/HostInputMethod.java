@@ -1,5 +1,6 @@
 package com.android.droidloom.ime;
 
+import android.icu.util.ULocale;
 import android.inputmethodservice.InputMethodService;
 import com.android.droidloom.runtime.HostChannel;
 import android.os.Handler;
@@ -7,6 +8,8 @@ import android.os.Looper;
 import android.text.InputType;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
+import android.view.inputmethod.InputMethodManager;
+import android.view.inputmethod.InputMethodSubtype;
 import org.json.JSONObject;
 import java.io.InputStream;
 import java.io.ByteArrayOutputStream;
@@ -26,6 +29,12 @@ public final class HostInputMethod extends InputMethodService {
     private boolean composing;
     private JSONObject state;
     private final EditorVisibility visibility = new EditorVisibility();
+    // The host's layout, kept until Android has attached this method: a
+    // subtype switch before that is ignored.
+    private String layoutLanguage, layoutType;
+    // The layout this process last switched Android to, as "language/type".
+    private String followedLayout;
+    private boolean attached;
 
     @Override public void onCreate() {
         super.onCreate();
@@ -58,6 +67,8 @@ public final class HostInputMethod extends InputMethodService {
         android.util.Log.i("DroidloomIME", "start input restarting=" + restarting
                 + " editable=" + (editor.inputType != InputType.TYPE_NULL));
         super.onStartInput(editor, restarting);
+        attached = true;
+        followHostLayout();
         session++;
         composing = false;
         visibility.start(editor.inputType != InputType.TYPE_NULL, restarting);
@@ -127,6 +138,15 @@ public final class HostInputMethod extends InputMethodService {
     }
 
     private void apply(JSONObject edit) {
+        JSONObject layout = edit.optJSONObject("keyboard_layout");
+        if (layout != null) {
+            String language = layout.optString("language"), type = layout.optString("type");
+            if (language.isEmpty() || language.length() > 35 || type.length() > 16) return;
+            layoutLanguage = language;
+            layoutType = type;
+            followHostLayout();
+            return;
+        }
         if (state == null || !state.optBoolean("active")
                 || edit.optLong("session", -1) != session) return;
         if (edit.optBoolean("dismiss")) {
@@ -170,6 +190,50 @@ public final class HostInputMethod extends InputMethodService {
                 if (!composing) connection.finishComposingText();
             }
         } finally { connection.endBatchEdit(); }
+    }
+
+    /**
+     * The host's keyboard layout, as a BCP 47 language tag and Android layout
+     * type. Android picks the physical keyboard layout of the current input
+     * method subtype's hint, so the host keyboard types as configured on the
+     * host and Android never asks. The subtype replaces the last one. A
+     * switch before Android has attached this method is ignored, so the
+     * first editor start makes it.
+     *
+     * Android's keyboard layout manager learns a subtype only when the
+     * selection changes, while the input method service restores the saved
+     * subtype, or picks the only one left, without telling it. Each switch
+     * therefore names a subtype other than the current one.
+     */
+    private void followHostLayout() {
+        final String language = layoutLanguage, type = layoutType;
+        if (language == null || !attached) return;
+        final String layout = language + "/" + type;
+        if (layout.equals(followedLayout)) return;
+        InputMethodSubtype current = getSystemService(InputMethodManager.class)
+                .getCurrentInputMethodSubtype();
+        int id = layout.hashCode();
+        if (current != null && current.hashCode() == id) id++;
+        ULocale locale = ULocale.forLanguageTag(language);
+        InputMethodSubtype subtype = new InputMethodSubtype.InputMethodSubtypeBuilder()
+                .setSubtypeId(id)
+                .setLanguageTag(language)
+                .setSubtypeLocale(locale.toString())
+                .setSubtypeMode("keyboard")
+                .setIsAsciiCapable(true)
+                .setPhysicalKeyboardHint(locale, type)
+                .build();
+        String component = new android.content.ComponentName(this, HostInputMethod.class)
+                .flattenToShortString();
+        try {
+            getSystemService(InputMethodManager.class)
+                    .setAdditionalInputMethodSubtypes(component, new InputMethodSubtype[] {subtype});
+            switchInputMethod(component, subtype);
+            followedLayout = layout;
+            android.util.Log.i("DroidloomIME", "host keyboard layout " + language + " " + type);
+        } catch (RuntimeException error) {
+            android.util.Log.w("DroidloomIME", "Unable to follow the host keyboard layout", error);
+        }
     }
 
     private static void close(HostChannel client) {

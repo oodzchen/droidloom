@@ -22,6 +22,7 @@ import android.os.Process;
 import android.os.SystemProperties;
 import android.os.SystemClock;
 import android.util.Slog;
+import android.view.WindowInsets;
 import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -49,6 +50,8 @@ final class DroidloomTaskBackend {
     // Tasks with a shown FLAG_KEEP_SCREEN_ON window, as of the last surface placement.
     private final IdentityHashMap<Task, Boolean> mKeepScreenOn = new IdentityHashMap<>();
     private final IdentityHashMap<Task, Boolean> mPlacedKeepScreenOn = new IdentityHashMap<>();
+    // Pixels of each task the host's on-screen keyboard covers, under mService.mGlobalLock.
+    private final IdentityHashMap<Task, Integer> mKeyboardInsets = new IdentityHashMap<>();
     // Accessed only on mWorker. Background tasks retain their existing host window.
     private final IdentityHashMap<Task, Snapshot> mPublished = new IdentityHashMap<>();
     private final IdentityHashMap<Task, Snapshot> mInputPublished = new IdentityHashMap<>();
@@ -62,7 +65,7 @@ final class DroidloomTaskBackend {
         final int id, user, display, parent;
         final long incarnation;
         final String owner;
-        final boolean ready, focused, hostFocused, keepScreenOn;
+        final boolean ready, focused, hostFocused, keepScreenOn, fullscreen;
         final Rect bounds;
         final IBinder inputToken;
         Snapshot(Task task, long incarnation, boolean hostFocused, boolean keepScreenOn,
@@ -78,6 +81,11 @@ final class DroidloomTaskBackend {
             focused = task.isFocused();
             this.hostFocused = hostFocused;
             this.keepScreenOn = keepScreenOn;
+            // The app hid the status bar, as a game does: the host shows the
+            // task's window fullscreen until the app shows the bar again.
+            // WindowState republishes the task when that request changes.
+            WindowState main = top == null ? null : top.findMainWindow();
+            fullscreen = main != null && !main.isRequestedVisible(WindowInsets.Type.statusBars());
             // As on Android, a task that does not cover the one it opened over,
             // such as a dialog, leaves that task running: the host gets it as
             // the window's parent. Only when that task's app started it, so a
@@ -92,7 +100,7 @@ final class DroidloomTaskBackend {
         }
         long[] publish(boolean activate) {
             return DroidloomTaskNative.registerTask(id, incarnation, user, display, owner, activate,
-                    keepScreenOn, parent);
+                    keepScreenOn, parent, fullscreen);
         }
         boolean sameInput(Snapshot other) {
             return other != null && incarnation == other.incarnation && display == other.display
@@ -177,6 +185,7 @@ final class DroidloomTaskBackend {
             }, true);
             mIncarnations.keySet().retainAll(live.keySet());
             mCreatedOver.keySet().retainAll(live.keySet());
+            mKeyboardInsets.keySet().retainAll(live.keySet());
         }
         return tasks;
     }
@@ -312,6 +321,10 @@ final class DroidloomTaskBackend {
                     if (command[5] != 0 && (command[5] < 72 || command[5] > 1280)) return;
                     setHostDensity(task, (int) command[5]);
                     break;
+                case 8:
+                    if (command[5] < 0 || command[5] > 16384) return;
+                    setHostKeyboardInset(task, (int) command[5]);
+                    break;
                 default:
                     throw new IllegalArgumentException("Unknown host window command");
             }
@@ -357,6 +370,30 @@ final class DroidloomTaskBackend {
             if (r.isVisibleRequested()) r.ensureActivityConfiguration(true /* ignoreVisibility */);
         });
         mService.mWindowManager.mWindowPlacerLocked.requestTraversal();
+    }
+
+    /**
+     * How much of the task's bottom edge the host's on-screen keyboard covers,
+     * in pixels. InsetsPolicy gives the task's windows an IME source of that
+     * height. Under mService.mGlobalLock.
+     */
+    int keyboardInset(Task task) {
+        final Integer height = mKeyboardInsets.get(task);
+        return height == null ? 0 : height;
+    }
+
+    /**
+     * The host's on-screen keyboard moved: the task's windows get their insets
+     * again, as when Android's own keyboard shows or hides. The host no longer
+     * moves the window, so the app makes room above the keyboard itself.
+     */
+    private void setHostKeyboardInset(Task task, int height) {
+        if (keyboardInset(task) == height) return;
+        if (height == 0) mKeyboardInsets.remove(task);
+        else mKeyboardInsets.put(task, height);
+        task.forAllWindows(w -> {
+            if (w.isReadyToDispatchInsetsState()) w.notifyInsetsChanged();
+        }, true /* traverseTopToBottom */);
     }
 
     /**

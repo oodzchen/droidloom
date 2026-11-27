@@ -2,9 +2,9 @@
 
 This guide covers the preview packages for x86_64 Arch Linux and aarch64 Arch
 Linux ARM. Prebuilt packages for both are in the
-[latest release](https://github.com/denialwm/droidloom/releases/latest). Read
-[known issues](KNOWN_ISSUES.md) before installing. To produce the packages yourself,
-follow [BUILDING.md](BUILDING.md), then return here.
+[latest release](https://github.com/denialwm/droidloom/releases/latest). To
+produce the packages yourself, follow [BUILDING.md](BUILDING.md), then return
+here.
 
 ## 1. Check prerequisites
 
@@ -19,12 +19,14 @@ follow [BUILDING.md](BUILDING.md), then return here.
   `droidloomctl gpu` lists them and chooses another.
 - A working systemd user session and administrator access through sudo or polkit.
 - At least 20 GiB free for packages, installed files and Android app data.
-  The package pair is about 975 MiB to download and 2.5 GiB installed, before apps.
+  The packages are about 975 MiB to download and 2.5 GiB installed, before apps.
+  Most of that is `droidloom-base`, which an update downloads again only when
+  Android's base partitions change.
 
 Run the desktop commands below in a terminal **inside your Wayland session**, as
 your ordinary user. Do not run `droidloomctl start` or app launches with sudo.
 
-## 2. Install both packages
+## 2. Install the packages
 
 Install or update from the published pacman repository:
 
@@ -45,14 +47,18 @@ On Arch Linux ARM (aarch64) the same script points pacman at the aarch64
 repository.
 Google apps are not included.
 
-For locally built packages, put one matching pair in a directory and run:
+`droidloom-base` comes with them as a dependency.
+
+For locally built packages, put one matching set in a directory and run:
 
 ```console
-sudo pacman -U ./droidloom-runtime-*.pkg.tar.zst ./droidloom-image-*.pkg.tar.zst
+sudo pacman -U ./droidloom-runtime-*.pkg.tar.zst ./droidloom-image-*.pkg.tar.zst ./droidloom-base-*.pkg.tar.zst
 ```
 
 Sudo allows pacman to install system files and dependencies and update its package
-database. Both packages are required and must have the same version and release.
+database. Runtime and image must have the same version and release; the image
+names the base version it needs. A build that reused the published base packs
+none: install that base from the repository.
 Installation leaves Droidloom stopped. No compilation runs on the recipient's
 machine when installing prebuilt packages.
 
@@ -141,12 +147,15 @@ droidloomctl applications
 droidloomctl launch com.android.settings
 ```
 
-A separate Settings window should appear. Optionally set Android's display
-density; 160 DPI was used for the desktop preview tests:
+A separate Settings window should appear. Optionally set Android's density;
+160 DPI was used for the desktop preview tests:
 
 ```console
 droidloomctl dpi 160
 ```
+
+DPI is the density at output scale 1: a window on an output of scale 1.25
+gets 1.25 × DPI. Without it, windows get 230 per unit of scale.
 
 The density persists. Desktop tiling determines the window's available size.
 
@@ -235,9 +244,7 @@ droidloomctl launch com.halfbrick.fruitninjafree \
 
 These examples assume you installed WhatsApp or the tested Fruit Ninja 2.8.9
 x86_64 APK. APKs are not bundled with Droidloom. Complete app registration and
-first-run prompts yourself. Revision 11 handles Fruit Ninja's launcher and
-age-screen handoffs without requiring an activity-specific retry; earlier
-revisions are affected by the [known launch issue](KNOWN_ISSUES.md).
+first-run prompts yourself.
 
 For games that choose their rendering size only at startup, set the initial
 Android task resolution in pixels:
@@ -314,14 +321,14 @@ droidloomctl start
 Startup is manual on login unless `droidloom.service` is enabled, though `droidloomctl launch` (and exported desktop launchers) starts a stopped runtime automatically.
 Stopping releases the runtime's resources and closes its Android windows.
 
-To upgrade, install the new matching package pair with the same `pacman -U`
+To upgrade, install the new matching packages with the same `pacman -U`
 command, then run `droidloomctl start`. The transaction stops Droidloom and retains
 Android data. Installing an older pair restores software, not changes to app data.
 
 To uninstall:
 
 ```console
-sudo pacman -R droidloom-runtime droidloom-image
+sudo pacman -R droidloom-runtime droidloom-image droidloom-base
 ```
 
 Sudo lets pacman stop the system service, remove package-owned files and update
@@ -369,4 +376,4 @@ journalctl -b -u droidloomd.service -n 200 --no-pager
 ```
 
 These commands do not require sudo. Replace the example package in crash reports
-with the failing app. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for current limits.
+with the failing app.

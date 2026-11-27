@@ -38,7 +38,15 @@ current versus maximum metrics, resizing and orientation changes. The existing
 size-compatibility scaling still runs afterward. Android maps mandatory gestures
 into system gestures as well. These sources have no surface or control leash,
 so an immersive app cannot hide the host bars through InsetsController.
-Keyboard and cutout sources retain their own policy. No tappable
+Its request still reaches the host: a task whose main window asks to hide the
+status bar is shown with `xdg_toplevel` fullscreen
+([native app integration](../native-app-integration.md)), and the compositor
+may hide its own bar over it.
+Android's own keyboard and cutout sources retain their own policy. The host's
+on-screen keyboard is a separate IME source with its own id, added only while
+the host reports a height for the window's task
+([architecture](../architecture.md#on-screen-keyboard)); `WindowMetrics` never
+include it. No tappable
 inset or Android system-bar window is created. Drawing the bars and
 handling gestures remain host responsibilities.
 

@@ -1,4 +1,5 @@
 //! Rust orchestration around makepkg and Fedora RPM package builds.
+mod base;
 mod components;
 mod fedora;
 mod runner;
@@ -154,6 +155,20 @@ enum Action {
     InstallTree {
         #[arg(long)]
         source: PathBuf,
+        #[arg(long)]
+        destination: PathBuf,
+    },
+    /// Print the droidloom-base version a staged payload's image depends on.
+    #[command(hide = true)]
+    BaseVersion {
+        #[arg(long)]
+        payload: PathBuf,
+    },
+    /// Install a staged payload's base tree when this build packs it.
+    #[command(hide = true)]
+    InstallBase {
+        #[arg(long)]
+        payload: PathBuf,
         #[arg(long)]
         destination: PathBuf,
     },
@@ -428,15 +443,9 @@ fn build(
     }
     let work = build_workspace(&repo)?;
     fs::create_dir_all(&work)?;
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(work.join("build.lock"))?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err("another Droidloom package build is already using this checkout".into());
-    }
-    let snapshot = work.join("source");
+    // One build per architecture; x86_64 and aarch64 may build together.
+    let _lock = lock(&work, architecture, false)?;
+    let snapshot = work.join(format!("source-{}", architecture.name()));
     let baseline = if components.is_empty() {
         None
     } else {
@@ -493,27 +502,33 @@ fn build(
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
-    let log_path = work.join(format!("build-{timestamp}.log"));
+    let log_path = work.join(format!("build-{}-{timestamp}.log", architecture.name()));
     let log = fs::OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(&log_path)?;
     eprintln!("Build log: {}", log_path.display());
-    run_logged(
-        podman(&work)
-            .args([
-                "build",
-                "--tag",
-                "localhost/droidloom-arch-builder",
-                "--file",
-            ])
-            .arg(repo.join("packaging/arch/Containerfile"))
-            .arg(repo.join("packaging/arch")),
-        &log,
-    )?;
-    // This storage belongs only to this checkout's package workflow. Drop
-    // superseded builder layers so dependency fixes do not fill the host disk.
-    run(podman(&work).args(["image", "prune", "--force"]))?;
+    {
+        // The other architecture's build may update the builder too.
+        let _image = wait_for(&work.join("builder-image.lock"))?;
+        run_logged(
+            podman(&work)
+                .args([
+                    "build",
+                    "--tag",
+                    "localhost/droidloom-arch-builder",
+                    "--file",
+                ])
+                .arg(repo.join("packaging/arch/Containerfile"))
+                .arg(repo.join("packaging/arch")),
+            &log,
+        )?;
+        // This storage belongs only to this checkout's package workflow. Drop
+        // superseded builder layers so dependency fixes do not fill the host disk.
+        run(podman(&work).args(["image", "prune", "--force"]))?;
+    }
+    let published = format!("published-base-{}.json", architecture.name());
+    base::fetch_published(architecture.name(), &cache.join(&published))?;
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
     let mut container = podman(&work);
@@ -544,7 +559,9 @@ fn build(
             },
             "--env",
             "CARGO_TARGET_DIR=/build/driver",
+            "--env",
         ])
+        .arg(format!("DROIDLOOM_PUBLISHED_BASE=/build/{published}"))
         .arg("--volume")
         .arg(format!("{}:/source:rw", snapshot.display()))
         .arg("--volume")
@@ -604,8 +621,9 @@ fn build(
         .collect::<std::io::Result<Vec<_>>>()?;
     packages.retain(|p| p.extension() == Some(OsStr::new("zst")));
     packages.sort();
-    if packages.len() != 2 {
-        return Err("build did not produce both runtime and image packages".into());
+    let decision = base::Decision::read(&output.join("base.json"))?;
+    if packages.len() != 2 + usize::from(decision.packed) {
+        return Err("build did not produce the runtime and image packages, with the base it decided to pack".into());
     }
     fs::write(
         output.join("build-summary.json"),
@@ -665,24 +683,23 @@ fn candidate(
         .ok_or("payload is not a candidate")?;
     fs::create_dir_all(destination)?;
     let destination = destination.canonicalize()?;
-    // The builder's makepkg folder is the package build's too.
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(work.join("build.lock"))?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
+    // The builder's makepkg folder for this architecture is the package
+    // build's too.
+    let _lock = lock(&work, architecture, true)?;
     let image = "localhost/droidloom-arch-builder";
-    match podman(&work).args(["image", "exists", image]).status()?.code() {
-        Some(0) => {}
-        Some(1) => run(podman(&work)
-            .args(["build", "--tag", image, "--file"])
-            .arg(repo.join("packaging/arch/Containerfile"))
-            .arg(repo.join("packaging/arch")))?,
-        _ => return Err("cannot access rootless Podman package storage".into()),
+    {
+        let _image = wait_for(&work.join("builder-image.lock"))?;
+        match podman(&work).args(["image", "exists", image]).status()?.code() {
+            Some(0) => {}
+            Some(1) => run(podman(&work)
+                .args(["build", "--tag", image, "--file"])
+                .arg(repo.join("packaging/arch/Containerfile"))
+                .arg(repo.join("packaging/arch")))?,
+            _ => return Err("cannot access rootless Podman package storage".into()),
+        }
     }
+    let published = format!("published-base-{}.json", architecture.name());
+    base::fetch_published(architecture.name(), &work.join("build").join(&published))?;
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
     run(podman(&work)
@@ -695,6 +712,8 @@ fn candidate(
             "DROIDLOOM_PREBUILT_PAYLOAD=/payload",
             "--env",
         ])
+        .arg(format!("DROIDLOOM_PUBLISHED_BASE=/build/{published}"))
+        .arg("--env")
         .arg(format!("DROIDLOOM_CANDIDATE={number}"))
         .arg("--volume")
         .arg(format!("{}:/source:ro", repo.display()))
@@ -723,6 +742,42 @@ fn candidate(
         ]))?;
     println!("Candidate packages in {}", destination.display());
     Ok(())
+}
+/// The lock of one architecture's package build in `work`: a build fails
+/// while another of the same architecture runs, a candidate waits for it.
+fn lock(work: &Path, architecture: Architecture, wait: bool) -> Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(work.join(format!("build-{}.lock", architecture.name())))?;
+    let mode = if wait {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_EX | libc::LOCK_NB
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), mode) } != 0 {
+        if wait {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        return Err(format!(
+            "another Droidloom {} package build is already using this checkout",
+            architecture.name()
+        )
+        .into());
+    }
+    Ok(file)
+}
+fn wait_for(path: &Path) -> Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(file)
 }
 fn quote_path(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
@@ -770,7 +825,8 @@ fn in_container(
     let repo = Path::new("/source");
     let work = Path::new("/build");
     let version = Version::read(repo, architecture)?;
-    let packaging = work.join("makepkg");
+    // The Android build shares /build; makepkg's folder is the architecture's.
+    let packaging = work.join(architecture.name()).join("makepkg");
     fs::create_dir_all(&packaging)?;
     remove_staging(&packaging.join("src/payload"))?;
     remove_staging(&packaging.join("pkg"))?;
@@ -815,18 +871,30 @@ fn in_container(
         cleanup_package_staging(&packaging);
         return Err(error);
     }
+    let decision = base::Decision::read(&packaging.join("src/payload/base.json"));
+    cleanup_package_staging(&packaging);
+    let decision = decision?;
     let packages = fs::read_dir(temporary.path())?
         .collect::<std::io::Result<Vec<_>>>()?
         .into_iter()
         .filter(|entry| entry.path().extension() == Some(OsStr::new("zst")))
         .collect::<Vec<_>>();
-    if packages.len() != 2 {
-        return Err("makepkg did not produce the complete package pair".into());
+    if packages.len() != 3 {
+        return Err("makepkg did not produce the runtime, image and base packages".into());
     }
     for entry in packages {
-        fs::rename(entry.path(), Path::new("/output").join(entry.file_name()))?;
+        let name = entry.file_name();
+        let base = name.to_string_lossy().starts_with("droidloom-base-");
+        if base && !decision.packed {
+            // An empty stand-in: the image depends on the published base.
+            fs::remove_file(entry.path())?;
+        } else if base && name.to_string_lossy() != decision.file() {
+            return Err("the packed base does not carry its decided version".into());
+        } else {
+            fs::rename(entry.path(), Path::new("/output").join(&name))?;
+        }
     }
-    cleanup_package_staging(&packaging);
+    fs::write("/output/base.json", serde_json::to_vec_pretty(&decision)?)?;
     Ok(())
 }
 
@@ -863,7 +931,20 @@ fn remove_staging(path: &Path) -> Result<()> {
     fs::remove_dir(path)?;
     Ok(())
 }
+/// Stages the payload makepkg packs, then decides whether its base is packed.
 fn compile(source: &Path, work: &Path, destination: &Path, jobs: usize) -> Result<()> {
+    stage_payload(source, work, destination, jobs)?;
+    let published = std::env::var_os("DROIDLOOM_PUBLISHED_BASE").map(PathBuf::from);
+    // A component build's baseline records the base its images came from.
+    let reused = Path::new("/baseline/base.json");
+    base::decide(
+        destination,
+        published.as_deref(),
+        reused.is_file().then_some(reused),
+    )
+}
+
+fn stage_payload(source: &Path, work: &Path, destination: &Path, jobs: usize) -> Result<()> {
     require_user()?;
     if let Some(payload) = std::env::var_os("DROIDLOOM_PREBUILT_PAYLOAD") {
         return install_tree(Path::new(&payload), destination);
@@ -1012,6 +1093,11 @@ fn execute() -> Result<()> {
             source,
             destination,
         } => install_tree(&source, &destination),
+        Action::BaseVersion { payload } => base::version(&payload),
+        Action::InstallBase {
+            payload,
+            destination,
+        } => base::install(&payload, &destination),
     }
 }
 fn main() {

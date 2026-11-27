@@ -5,7 +5,7 @@
 %define _binary_payload w3.zstdio
 %{!?stage_dir:%global stage_dir %{_topdir}/../stage-runtime}
 %{!?pkg_version:%global pkg_version 0.1.0}
-%{!?pkg_release:%global pkg_release 42}
+%{!?pkg_release:%global pkg_release 51}
 
 Name:           droidloom-runtime
 Version:        %{pkg_version}

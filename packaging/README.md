@@ -2,8 +2,10 @@
 
 For installation and source builds, use the [Arch Linux guide](arch/README.md).
 
-The native package split is `droidloom-runtime` and `droidloom-image`, with
-optional hardware-service packages. `droidloom-runtime` owns the supervisor,
+The native package split is `droidloom-runtime`, `droidloom-image` and
+`droidloom-base`, with optional hardware-service packages. `droidloom-base`
+holds the Android partitions that rarely change and is published only when
+they do ([build guide](../docs/BUILDING.md#shipping-with-github-actions)). `droidloom-runtime` owns the supervisor,
 CLI, user lifecycle service, private Android endpoint, and ordinary Wayland
 presenter. Denial has no Droidloom package dependency, plugin, service drop-in,
 or product-specific environment.
@@ -77,9 +79,13 @@ only root-owned, non-group/world-writable specifications below
 `droidloomctl dpi DPI` applies Android's standard built-in-display density
 override. WindowManager persists the
 value in the per-user Android data directory, which the installer retains across
-Droidloom upgrades and host restarts. The display's pixel canvas remains the
-host output's oriented physical resolution; DPI changes UI sizing, not render
-resolution.
+Droidloom upgrades and host restarts. Each window is laid out at the density
+the presenter gives it, which overrides the display's, so the command also sets
+`dpiPerScale` to DPI in `$XDG_CONFIG_HOME/droidloom/density-v1.json`, creating
+it when missing: a window on an output of scale 1.25 gets 1.25 × DPI. A size set
+for one output (`outputs`) stays. Open windows follow at once. The display's
+pixel canvas remains the host output's oriented physical resolution; DPI changes
+UI sizing, not render resolution.
 
 `droidloomctl window-mode fit-output` is the default mobile policy. For a
 size-less initial XDG configure, the presenter waits for the standard
@@ -99,7 +105,8 @@ sizes live at `$XDG_STATE_HOME/droidloom/window-sizes-v1.json`.
 
 ## Build and installation ownership
 
-The Rust package builder produces `droidloom-runtime` and `droidloom-image`.
+The Rust package builder produces `droidloom-runtime` and `droidloom-image`,
+and `droidloom-base` when its partitions changed.
 Pacman owns their system files. Rust package support handles first-user setup,
 service permissions and transaction hooks. Upgrades stop Droidloom and leave it
 stopped; removal retains application data. See the [package guide](arch/README.md)
@@ -122,7 +129,7 @@ The Rust builder checks required components, executable permissions, architectur
 and compiled input ABI metadata, including alternate input-bridge copies. It
 accepts compatible byte differences and extra files; pinned upstream inputs
 retain their integrity checks. The pacman workflow uses this builder to produce
-a matched runtime/image pair.
+matched runtime, image and base packages.
 
 The retained ARM64 installer uses a sealed manifest with file hashes, modes,
 symlinks and input ABI checks. This is specific to that installer, not an added

@@ -1,8 +1,9 @@
 # Build the pacman packages
 
 The Rust package builder compiles Droidloom's host programs and modified Android
-components, assembles the Android image, and produces a matching runtime/image
-pacman package pair. It uses pinned upstream Android base and toolchain inputs;
+components, assembles the Android image, and produces matching
+`droidloom-runtime` and `droidloom-image` pacman packages, with `droidloom-base`
+when its Android partitions changed. It uses pinned upstream Android base and toolchain inputs;
 it does not rebuild every upstream Android component from source.
 
 ## Shipping with GitHub Actions
@@ -20,6 +21,17 @@ bytes match. If a rebuilt package differs, increment the release. Old archives
 stay available for users with cached pacman databases. Each package release also
 includes a matching Git source snapshot; pinned upstream sources and licenses
 are documented in that snapshot. Optional Google apps are not published.
+
+`droidloom-base` holds the Android partitions that change only with the pinned
+base, Teto or the image policy: `system.img`, `system_ext.img` and
+`product.img`, about 850 MiB of each architecture's download. Their derivation
+is reproducible, so a build compares their SHA-256 with the published
+`<architecture>/base.json` on Pages. When they match, the build packs no base
+and `droidloom-image` depends on the published `droidloom-base` version; the
+pacman database keeps that entry, and the package checks install a stand-in of
+the same name and version with empty images. When they differ, or no record is
+published, the build packs `droidloom-base` with the release's own version. A
+build records its decision in `base.json` beside the packages.
 
 ### Manually controlled local worker
 
@@ -396,8 +408,10 @@ dist/arch/0.1.0-7/aarch64/droidloom-runtime-0.1.0-7-aarch64.pkg.tar.zst
 dist/arch/0.1.0-7/aarch64/droidloom-image-0.1.0-7-aarch64.pkg.tar.zst
 ```
 
-The command prints the exact installation command when finished. Install both
-packages by following [INSTALL.md](INSTALL.md).
+Each architecture's folder also holds `base.json`, and
+`droidloom-base-0.1.0-7-<architecture>.pkg.tar.zst` when the build packed the
+base. The command prints the exact installation command when finished. Install
+the packages by following [INSTALL.md](INSTALL.md).
 
 Normal builds fetch [Teto](https://github.com/denialwm/teto), the Translation
 Engine with Target Optimization, at exact commit
@@ -637,7 +651,10 @@ to record their inputs. Keep that baseline's archives, summary and
 `component-inputs.json` together. Unselected source edits are not included.
 
 Rerun the same build command to reuse caches. Downloads, sparse AOSP sources and
-outputs live under `.work/arch`; build attempts save `build-*.log` there.
+outputs live under `.work/arch`; build attempts save `build-ARCH-*.log` there.
+The x86_64 and aarch64 builds may run at the same time, as shipping runs them:
+each prepares its inputs, host programs and packages on its own, and they take
+turns for the Android compile, which shares one source tree and Soong output.
 `build --clean` removes this workflow's compiler outputs while retaining downloads.
 An existing sparse AOSP source checkout can seed a build with
 `build --source-cache /path/to/checkout`; installed binaries are not build inputs.
@@ -646,8 +663,7 @@ If staging fails with `No space left on device`, free disposable outputs and rer
 the builder. Do not distribute partial archives from a failed attempt. APKs,
 packages, caches and local test artifacts must stay out of Git.
 
-The fully empty-cache source-download path has not yet been rehearsed; see
-[KNOWN_ISSUES.md](KNOWN_ISSUES.md). Build logs should accompany reports of failures.
+Build logs should accompany reports of failures.
 
 ## Desktop image policy
 
@@ -760,8 +776,7 @@ This is a desktop workaround, not a general default for devices with Wi-Fi.
 Google subsequently updated Play Services to 26.33.32 and Play Store to 53.0.27,
 both targeting API 37. The user confirmed NTE launches successfully after an
 official **Update from Play**, following permission repair and a local catalog
-compatibility experiment; see the
-[app-service limitations](KNOWN_ISSUES.md#application-compatibility).
+compatibility experiment.
 
 The default selects Google Services Framework, Play Services and Play Store.
 `--sync-adapters` also selects Google Contacts and Calendar sync. Configuration

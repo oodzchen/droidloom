@@ -29,6 +29,13 @@ root/system. Regenerate them with `python3 tools/droidloom-systemui-stubs` when
 advancing the pinned framework interfaces; `--check` verifies the checked-in
 adapters. The updater also checks their source hashes against the build inputs.
 
+Android's music volume and screen brightness follow the host. Android's volume curve plays music
+at full scale, SystemUI's `HostVolume` passes the music volume to the host's
+default output and back, and `HostBrightness` passes Android's brightness setting
+and any window's brightness to the backlight, both over host channels to the
+user's brokers; the host's own changes come back. See the runtime layout
+contract, "Media volume and screen brightness".
+
 Biometric prompts open no window: the host marks the sensor and runs the reader
 (under Denial, through `denial-fingerprint-verify-v1`), so the asking app stays
 in front. SystemUI starts the sensor at once, answers a match as confirmed and
@@ -107,6 +114,18 @@ it, and drops it when the host has no fingers or Android no credential. The HAL
 replaces `generation` in `/data/vendor/droidloom-authentication` when the
 enrollment or its authenticator ID changes; the provider then enumerates again
 and reloads the authenticator IDs.
+
+`0010-droidloom-host-keyboard-notification.patch` keeps the Droidloom host
+keyboard out of Android's keyboard layout notification. Its layout comes from
+the host through the input method's subtype
+([text input](../../docs/contracts/text-input-v1.md#host-keyboard-layout)), so
+Android neither asks to configure it nor reports the layout it chose.
+
+`0011-droidloom-no-boot-brightness-override.patch` drops PowerManagerService's
+boot brightness override, which holds Android's default brightness until boot
+completes to match a bootloader picture a cell does not have. Android reports
+every override as a window's, and SystemUI gives a window's level to the host's
+backlight, so the host's screen flashed to that default at each start.
 
 `DroidloomCredential` gives Android user 0 a random 32-character password that
 nobody types. The lifecycle daemon keeps it beside the cell's storage on the
@@ -234,6 +253,10 @@ every shown `FLAG_KEEP_SCREEN_ON` window of the default display to the backend
 during surface placement. The task's publication carries the flag, and the host
 keeps its displays on while that task's window is visible.
 
+Its `WindowState` hunk republishes a task when a window's requested status bar
+visibility changes. The publication says whether the main window of the task's
+top activity hid the status bar, and the host shows that task fullscreen.
+
 The bounded command queue coalesces resize, focus and hide/show updates, preserves the
 existing 80 ms resize debounce and retains each command until acknowledged.
 Close invalidates its window's pending resize/focus operations. Reconnects can
@@ -254,7 +277,7 @@ When testing over an older installation, also build and activate the matching
 required capabilities, including display power; a stale presenter can reject
 the rebuilt Composer before Android boots. Restart Droidloom after selecting
 the matching components.
-Bundle checks require `DROIDLOOM_TASK_BACKEND_ABI=4;` in services, InputFlinger,
+Bundle checks require `DROIDLOOM_TASK_BACKEND_ABI=5;` in services, InputFlinger,
 the launch client and Composer. Runtime acceptance must cover cold/reused
 launches, aliases/trampolines, permission/authentication handoffs, Play Store
 Open, deep links, shares, task removal/reuse and Composer reconnects. Unit and

@@ -63,7 +63,7 @@ compiler filter, profile and app image the base used for each. The result, with
 the base's other oat files unchanged, replaces `/system/framework/oat/<isa>`. The package
 must contain window-policy ABI 1 metadata in both compiled artifacts; native
 architecture must match the cell, and JNI checks the ABI again before WMS starts.
-The framework task backend additionally requires task-backend ABI 4 metadata
+The framework task backend additionally requires task-backend ABI 5 metadata
 in services, InputFlinger and Composer. Native input ABI 2
 pairs services, InputFlinger and Composer; host channels ABI 1 pairs services,
 SystemUI, IME and the presenter. The standalone input support process and its
@@ -200,16 +200,17 @@ disabled. These projections may contain executable compatibility helpers, but
 they are not Android-writable storage and cannot target `/system`, `/vendor`,
 `/data`, or another Android namespace.
 
-## Private haptics, camera and fingerprint endpoints (DLDEV001)
+## Private haptics, camera, fingerprint and location endpoints (DLDEV001)
 
 The user `droidloom-devices.socket` unit owns `%t/droidloom/haptics.sock`,
-`%t/droidloom/camera.sock` and `%t/droidloom/fingerprint.sock` under the same
-mode-0700 runtime directory. The supervisor may bind only those inodes at
-`/dev/socket/droidloom/haptics`, `/dev/socket/droidloom/camera` and
-`/dev/socket/droidloom/fingerprint`. One broker, `droidloom-devices`, runs as
-the host user and serves all three; it authenticates the kernel-mapped UID of
-the vibrator HAL (system, 1000), the camera provider (cameraserver, 1047) and
-the authentication service (root, 0) on each.
+`%t/droidloom/camera.sock`, `%t/droidloom/fingerprint.sock` and
+`%t/droidloom/location.sock` under the same mode-0700 runtime directory. The
+supervisor may bind only those inodes at `/dev/socket/droidloom/haptics`,
+`/dev/socket/droidloom/camera`, `/dev/socket/droidloom/fingerprint` and
+`/dev/socket/droidloom/location`. One broker, `droidloom-devices`, runs as
+the host user and serves all four; it authenticates the kernel-mapped UID of
+the vibrator HAL (system, 1000), the camera provider (cameraserver, 1047),
+the authentication service (root, 0) and the GNSS HAL (gps, 1021) on each.
 
 Records carry `DLDEV001`, a kind and bounded fields. Haptics clients send
 patterns of at most 64 steps and 30 seconds, which the broker plays through
@@ -225,9 +226,59 @@ fprintd's reader for each verification only, listens again after a no-match,
 and stops and releases the reader however it ends. Without hapticd, braun or
 fprintd the broker reports no vibrator, no cameras and no reader.
 
+GNSS clients start and stop location. While started, the broker holds
+dmail's `org.dmail.Location1.Start` on a private system-bus connection, so
+the modem's engine runs only while Android navigates and stops when the
+client, the broker or its connection goes. It sends the engine's state and
+satellite counts on each change; every final fix: latitude, longitude,
+horizontal accuracy (68%), ellipsoid altitude, speed and heading, and the
+vertical, speed and heading accuracies where known, the fix's Unix time and
+the satellites used; and the satellite list on each change, one entry for
+each satellite and band, at most 128: system, number, band, carrier
+frequency, C/N0, elevation, azimuth, and whether it is tracked, used and has
+ephemeris and almanac. The host user needs dmail's group;
+without dmail, or without access, the broker reports the engine unavailable.
+
 The broker only runs the reader: the authentication service counts a match
 once the supervisor, as root, has seen fprintd announce it on the system bus,
 and passes it through `/dev/socket/droidloom-authentication` (root, 0600).
+
+## Media volume and screen brightness
+
+`droidloom-audio.socket` also owns `%t/droidloom/volume.sock`, and
+`droidloom-devices.socket` `%t/droidloom/brightness.sock`. The supervisor
+binds them at `/dev/socket/droidloom-framework-host/volume` and
+`.../brightness`, where only `system_server` reaches them. It hands them to
+SystemUI as host channels 4 and 5, connecting as itself, so each broker
+authenticates system (1000). Records are DLDEV001; a level is 0 to 1.
+
+Volume: the host mixer owns loudness. Android's volume curves play every
+stream on its host output at full scale at every step but 0
+(`audio_policy_volumes.xml`, speaker category, which the BUS output falls
+in), so Android's music volume only moves the host's. SystemUI
+sends each change of the music volume, with mute, to the broker, which sets
+the default output's volume as pipewire-pulse does: on the card's active
+route when the sink has one, else on the node. Levels are what host mixers
+show, the cube root of the linear gain; the balance between channels stays.
+The broker sends the output's level when SystemUI connects and on each change
+made on the host, except the levels Android set in the last two seconds;
+SystemUI makes it Android's music volume, at least step 1 for any level above
+0, since step 0 is silence in Android. Android's own mute at step 0 is not
+sent as the host's mute. The other streams' volumes (ring, alarms,
+notifications) stay inside Android and only silence a stream at 0.
+
+Brightness: the broker drives the backlight Denial does (a panel's own
+before a platform or firmware one), writing sysfs when the user may and
+otherwise logind's `SetBrightness` on the user's display session; it never
+writes 0. It sends the backlight's level when SystemUI connects and after
+each write it did not make (the kernel wakes a poll on `actual_brightness`);
+SystemUI makes it Android's brightness setting. While Android's display is
+on, SystemUI sends Android's setting when an app changes it, and the level a
+window asks for while it shows (`screenBrightness`, as video players set it).
+When no window asks any more, or SystemUI goes, the broker puts back the
+level before the first window's, unless something else wrote the backlight
+meanwhile. Without a backlight the broker says so and Android's brightness
+stays inside it.
 
 ## Credential prompts
 

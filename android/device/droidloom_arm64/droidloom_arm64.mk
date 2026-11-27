@@ -45,6 +45,7 @@ PRODUCT_PACKAGES += \
     android.hardware.health-service.example \
     android.hardware.power-service.droidloom \
     android.hardware.vibrator-service.droidloom \
+    android.hardware.gnss-service.droidloom \
     android.hardware.camera.provider-service.droidloom \
     droidloom-authentication-service \
     com.android.hardware.audio.droidloom \
@@ -78,7 +79,7 @@ PRODUCT_COPY_FILES += \
     vendor/droidloom/android/device/droidloom_arm64/audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio_policy_configuration.xml \
     vendor/droidloom/android/device/droidloom_arm64/droidloom_primary_audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/droidloom_primary_audio_policy_configuration.xml \
     vendor/droidloom/android/device/droidloom_arm64/media_profiles_V1_0.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_profiles_V1_0.xml \
-    frameworks/av/services/audiopolicy/config/audio_policy_volumes.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio_policy_volumes.xml \
+    vendor/droidloom/android/device/droidloom_arm64/audio_policy_volumes.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio_policy_volumes.xml \
     frameworks/av/services/audiopolicy/config/default_volume_tables.xml:$(TARGET_COPY_OUT_VENDOR)/etc/default_volume_tables.xml \
     frameworks/av/services/audiopolicy/config/surround_sound_configuration_5_0.xml:$(TARGET_COPY_OUT_VENDOR)/etc/surround_sound_configuration_5_0.xml
 

@@ -11,7 +11,7 @@
   "image_dir": "/var/lib/droidloom/images/current",
   "vendor_image": "/var/lib/droidloom/images/current/images/vendor.raw.img",
   "android_init": "/usr/lib/droidloom/current/bin/droidloom-android-init",
-  "share_user_folders": true,
+  "share_user_folders": false,
   "android_file_overrides": [
     {
       "source": "/usr/lib/droidloom/current/lib64/libaudiobase.so",
@@ -68,6 +68,10 @@
     {
       "source": "/usr/lib/droidloom/current/bin/droidloom-lmkd-compat",
       "target": "/system/bin/lmkd"
+    },
+    {
+      "source": "/usr/lib/droidloom/current/bin/droidloom-lmkd-compat",
+      "target": "/vendor/bin/droidloom-lmkd-compat"
     },
     {
       "source": "/usr/lib/droidloom/current/compat/netd-mainline-bpf.rc",

@@ -1,7 +1,10 @@
 //! Per-user audio endpoint entry point: Android's streams on one socket, its
 //! media volume on another ([`droidloom_audio::volume`]).
-use clap::Parser;
-use droidloom_audio::{Options, serve_connection, volume::serve_volume};
+use clap::{Parser, ValueEnum};
+use droidloom_audio::{
+    Options, serve_connection,
+    volume::{StreamVolumeHub, serve_volume, serve_volume_disabled},
+};
 use droidloom_audio_protocol::{IpcError, SeqPacket, SeqPacketListener};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -41,6 +44,38 @@ struct Arguments {
     /// Explicit loopback capture from a sink monitor for diagnostics.
     #[arg(long)]
     capture_sink: bool,
+    /// Media volume mode: stream (per-app in desktop), host (default sink), or off.
+    #[arg(long, value_enum)]
+    volume_mode: Option<VolumeMode>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum VolumeMode {
+    Stream,
+    Host,
+    Off,
+}
+
+fn resolve_volume_mode(
+    cli: Option<VolumeMode>,
+    env_override: Option<&str>,
+    session_mode: Option<&str>,
+) -> VolumeMode {
+    if let Some(mode) = cli {
+        return mode;
+    }
+    match env_override {
+        Some("stream") => VolumeMode::Stream,
+        Some("host" | "1" | "true") => VolumeMode::Host,
+        Some("off" | "0" | "false") => VolumeMode::Off,
+        _ => {
+            if session_mode == Some("desktop") {
+                VolumeMode::Stream
+            } else {
+                VolumeMode::Host
+            }
+        }
+    }
 }
 
 fn run(arguments: Arguments) -> io::Result<()> {
@@ -116,15 +151,33 @@ fn run(arguments: Arguments) -> io::Result<()> {
     if !activated {
         std::fs::set_permissions(&arguments.socket, std::fs::Permissions::from_mode(0o666))?;
     }
+    let volume_mode = resolve_volume_mode(
+        arguments.volume_mode,
+        std::env::var("DROIDLOOM_HOST_VOLUME").ok().as_deref(),
+        std::env::var("DROIDLOOM_MODE").ok().as_deref(),
+    );
+    let stream_volume = (volume_mode == VolumeMode::Stream).then(StreamVolumeHub::new);
     if let Some(listener) = volume {
         check_peer_uid_mapping(
             &std::fs::read_to_string("/proc/self/uid_map")?,
             arguments.volume_peer_uid,
         )?;
-        let (peer_uid, remote) = (arguments.volume_peer_uid, arguments.remote.clone());
+        let (peer_uid, remote, stream_hub) = (
+            arguments.volume_peer_uid,
+            arguments.remote.clone(),
+            stream_volume.clone(),
+        );
         std::thread::Builder::new()
             .name("volume".into())
-            .spawn(move || serve_volumes(&listener, peer_uid, remote.as_deref()))?;
+            .spawn(move || {
+                serve_volumes(
+                    &listener,
+                    peer_uid,
+                    remote.as_deref(),
+                    volume_mode,
+                    stream_hub,
+                )
+            })?;
     }
     let options = Options {
         peer_uid: arguments.peer_uid,
@@ -133,6 +186,7 @@ fn run(arguments: Arguments) -> io::Result<()> {
         target: arguments.target,
         remote: arguments.remote,
         capture_sink: arguments.capture_sink,
+        stream_volume,
     };
     let clients = Arc::new(AtomicUsize::new(0));
     loop {
@@ -160,7 +214,13 @@ fn run(arguments: Arguments) -> io::Result<()> {
 }
 
 /// Serves Android's media volume, one SystemUI connection at a time.
-fn serve_volumes(listener: &SeqPacketListener, peer_uid: u32, remote: Option<&str>) {
+fn serve_volumes(
+    listener: &SeqPacketListener,
+    peer_uid: u32,
+    remote: Option<&str>,
+    mode: VolumeMode,
+    stream_hub: Option<Arc<StreamVolumeHub>>,
+) {
     loop {
         let socket = match listener.accept() {
             Ok(socket) => socket,
@@ -173,7 +233,15 @@ fn serve_volumes(listener: &SeqPacketListener, peer_uid: u32, remote: Option<&st
         if !peer_is(&socket, peer_uid) {
             continue;
         }
-        if let Err(error) = serve_volume(socket, remote) {
+        let result = match mode {
+            VolumeMode::Stream => match &stream_hub {
+                Some(hub) => hub.serve_stream_volume(socket),
+                None => serve_volume_disabled(socket),
+            },
+            VolumeMode::Host => serve_volume(socket, remote),
+            VolumeMode::Off => serve_volume_disabled(socket),
+        };
+        if let Err(error) = result {
             eprintln!("droidloom-audio: volume connection ended: {error}");
         }
     }
@@ -245,7 +313,31 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::check_peer_uid_mapping;
+    use super::{VolumeMode, check_peer_uid_mapping, resolve_volume_mode};
+
+    #[test]
+    fn volume_mode_policy_respects_cli_env_and_session_mode() {
+        assert_eq!(
+            resolve_volume_mode(Some(VolumeMode::Off), Some("host"), Some("mobile")),
+            VolumeMode::Off
+        );
+        assert_eq!(
+            resolve_volume_mode(None, None, Some("desktop")),
+            VolumeMode::Stream
+        );
+        assert_eq!(
+            resolve_volume_mode(None, None, Some("mobile")),
+            VolumeMode::Host
+        );
+        assert_eq!(
+            resolve_volume_mode(None, Some("host"), Some("desktop")),
+            VolumeMode::Host
+        );
+        assert_eq!(
+            resolve_volume_mode(None, Some("off"), Some("desktop")),
+            VolumeMode::Off
+        );
+    }
 
     #[test]
     fn cross_uid_endpoint_requires_a_visible_peer_uid() {

@@ -303,6 +303,7 @@ context.objects = [
             target: Some("test.sink".into()),
             remote: Some(self.remote().to_str().unwrap().into()),
             capture_sink: true,
+            stream_volume: None,
         };
         let worker = thread::spawn(move || serve_connection(listener.accept().unwrap(), &options));
         let client = Client::connect(
@@ -716,6 +717,7 @@ fn capture_is_rejected_before_allocating_or_connecting_pipewire() {
         target: None,
         remote: None,
         capture_sink: false,
+        stream_volume: None,
     };
     let worker = thread::spawn(move || serve_connection(listener.accept().unwrap(), &options));
     let result = Client::connect(
@@ -788,6 +790,7 @@ fn stale_generations_and_unowned_credits_close_the_connection() {
             target: None,
             remote: Some(pipewire.remote().to_str().unwrap().into()),
             capture_sink: false,
+            stream_volume: None,
         };
         let worker = thread::spawn(move || serve_connection(listener.accept().unwrap(), &options));
         let socket = SeqPacket::connect(&path).unwrap();
@@ -827,6 +830,7 @@ fn peer_uid_is_checked_before_pipewire_is_opened() {
         target: None,
         remote: None,
         capture_sink: false,
+        stream_volume: None,
     };
     let worker = thread::spawn(move || serve_connection(listener.accept().unwrap(), &options));
     assert!(
@@ -937,4 +941,67 @@ fn pipewire_death_invalidates_the_stream_generation() {
     }
     drop(playback);
     assert!(worker.join().unwrap().is_err());
+}
+
+#[test]
+fn stream_volume_scales_only_droidloom_streams() {
+    use droidloom_audio::volume::StreamVolumeHub;
+    use droidloom_device_protocol::{MAX_RECORD, Message as DeviceMessage};
+    use std::sync::Arc;
+
+    let pipewire = PipeWire::new();
+    let hub = StreamVolumeHub::new();
+    let (vol_client, vol_server) = SeqPacket::pair().unwrap();
+    let hub_worker = Arc::clone(&hub);
+    let vol_thread = thread::spawn(move || hub_worker.serve_stream_volume(vol_server));
+
+    let mut vbuf = [0u8; MAX_RECORD];
+    let init = DeviceMessage::decode(vol_client.receive_record_into(&mut vbuf).unwrap().bytes).unwrap();
+    assert!(matches!(
+        init,
+        DeviceMessage::VolumeState { level, muted: false } if (level - 1.0).abs() < 1e-6
+    ));
+
+    let path = pipewire.directory.path().join("stream-vol.sock");
+    let listener = SeqPacketListener::bind(&path).unwrap();
+    let options = Options {
+        // SAFETY: reads test credentials.
+        peer_uid: unsafe { libc::geteuid() },
+        allow_capture: false,
+        target: Some("test.sink".into()),
+        remote: Some(pipewire.remote().to_str().unwrap().into()),
+        capture_sink: false,
+        stream_volume: Some(Arc::clone(&hub)),
+    };
+    let worker = thread::spawn(move || serve_connection(listener.accept().unwrap(), &options));
+    let mut playback = Client::connect(
+        &path,
+        Format {
+            direction: Direction::Playback,
+            rate: RATE,
+            channels: 1,
+            frames: 1024,
+        },
+    )
+    .unwrap();
+    pipewire.link(&playback.node_name(), true);
+    playback.control(START).unwrap();
+
+    // Set stream volume to 50% (0.125 linear) and muted via Android protocol.
+    vol_client
+        .send_record(
+            &DeviceMessage::VolumeSet {
+                level: 0.5,
+                muted: true,
+            }
+            .encode(),
+            &[],
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+
+    drop(playback);
+    let _ = worker.join().unwrap();
+    drop(vol_client);
+    vol_thread.join().unwrap().unwrap();
 }

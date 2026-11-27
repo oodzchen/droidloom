@@ -69,17 +69,20 @@ Droidloom's core architecture is well-suited for desktop integration and does no
    - *Impact*: Eliminates unnecessary Python startup on every `droidloom.service` launch.
    - *Trade-off*: If a hardware accelerometer is later connected, the user must re-enable `droidloom-orientation-sync.service`.
 
-### Phase 2 — Resource & Hardware Containment (Planned)
+### Phase 2 — Resource & Hardware Containment (Implemented)
 
 1. **Per-stream audio volume in desktop mode (`droidloom-audio`)**:
-   - *Plan*: In `DROIDLOOM_MODE=desktop`, return `VolumeUnavailable` on `volume.sock` (or apply gain only to Droidloom's own PipeWire streams) instead of modifying the host default sink's master volume and `SPA_PARAM_ROUTE_save`.
-   - *Trade-off*: Android's system volume slider will no longer control the host's master speaker volume; users adjust Android volume independently via the desktop mixer (e.g., Plasma Audio applet) or inside Android.
-2. **Cgroup memory cap & PSI-driven container LMKD**:
-   - *Plan*: Configure `MemoryHigh` / `MemoryMax` on `droidloomd.service` (e.g., 40–50% of host RAM) and upgrade `droidloom-lmkd-compat` to monitor the cell's own `memory.pressure` (PSI) and `memory.current` to reclaim background Android processes inside the cell.
-   - *Trade-off*: Heavy Android games or simultaneous apps may be killed earlier by Android's LMKD when approaching the cell cap, in exchange for guaranteeing host desktop stability.
-3. **Narrow default shared folders**:
-   - *Plan*: Replace automatic sharing of all 5 XDG folders (especially `~/Documents`) with a dedicated exchange folder (e.g., `~/Downloads/Droidloom`) or per-file `xdg-desktop-portal` FileChooser grants, avoiding `setgid` changes on standard host directories.
-   - *Trade-off*: Android apps will only see files placed in the dedicated shared folder (or explicitly picked via portal) rather than the user's entire `~/Documents` or `~/Pictures` tree.
+   - *Change*: Added `--volume-mode` (`stream` | `host` | `off`) and `DROIDLOOM_HOST_VOLUME` override. In `DROIDLOOM_MODE=desktop`, `droidloom-audio` defaults to `stream` (`StreamVolumeHub`), scaling only Droidloom's own PipeWire playback streams (`pw_stream_set_control`) and reflecting per-stream mixer adjustments back to Android without touching the host default sink's master volume or `SPA_PARAM_ROUTE_save`. `mobile` retains `host` mode.
+   - *Impact*: Android apps and volume sliders can no longer alter the host's global speaker volume or mute state while still preserving independent Android volume control and KDE Plasma per-app stream mixer sync.
+   - *Trade-off*: Android's system volume slider no longer controls the host's master speaker volume; if an app expects hardware master-volume behavior on desktop, users must set `DROIDLOOM_HOST_VOLUME=host`.
+2. **Cgroup memory cap & container-local LMKD (`droidloomd.service` + `droidloom-lmkd-compat`)**:
+   - *Change*: Added `MemoryHigh=40%`, `MemoryMax=50%`, and `TasksMax=8192` to `droidloomd.service`. Upgraded `droidloom-lmkd-compat` to track Android 17 `LMK_PROCPRIO` (16/20/24-byte) and batch `LMK_PROCS_PRIO` (cmd 11) updates in memory, monitor the cell root `/sys/fs/cgroup` (`memory.current` and PSI `memory.pressure`), and reclaim background/cached Android processes (`oom_score_adj >= 200`) inside the cell before host-wide OOM occurs. Also bind-mounted `/vendor/bin/droidloom-lmkd-compat` in `cell-spec-*.json` so containers run the updated binary instead of the baked-in vendor copy. Because `droidloom-supervisor` mounts `/proc` read-only (`bind,ro`, leaving only `/proc/sys/net` writable) for host kernel safety, `/proc/<pid>/oom_score_adj` remains `0` in kernel sysfs/procfs while `droidloom-lmkd-compat` enforces priority-ordered background reclaim directly.
+   - *Impact*: Guarantees runaway Android games or memory leaks are contained and reclaimed inside the cell rather than triggering the Linux OOM killer against desktop applications, without weakening read-only `/proc` host isolation.
+   - *Trade-off*: Heavy Android workloads approaching 40–50% of host RAM (or sustained PSI pressure under parent `MemoryHigh`) will have background Android apps terminated earlier, and host tools reading `/proc/<pid>/oom_score_adj` still see `0` while `/proc` stays read-only; hosts with custom budgets should override via `systemctl edit droidloomd.service`.
+3. **Narrow default shared folders (`cell-spec-*.json`)**:
+   - *Change*: Defaulted `share_user_folders` to `false` in `packaging/cell-spec-arm64.json` and `packaging/cell-spec-x86_64-u1000.json`, and added a safety notice in `droidloom-settings` Storage UI recommending a dedicated exchange folder (such as `~/Downloads/Droidloom`) instead of exposing `~/Documents`.
+   - *Impact*: Prevents Android apps with storage permission from reading or modifying host files/executables in `~/Documents`, `~/Pictures`, `~/Music`, `~/Videos`, and `~/Downloads`, and avoids mutating `setgid` bits on standard host XDG folders.
+   - *Trade-off*: Android apps can only access files explicitly placed into configured `shared_storage_directories` (e.g., `~/Downloads/Droidloom`) unless the user opts back into `share_user_folders`.
 
 ### Phase 3 — Security & Sidecar Consolidation (Long-Term)
 

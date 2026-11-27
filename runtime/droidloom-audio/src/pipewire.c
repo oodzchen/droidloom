@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Narrow ABI for SPA's inline builders and PipeWire buffer ownership. No PCM memcpy.
 #include <errno.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,6 +9,11 @@
 #include <pipewire/pipewire.h>
 #include <spa/param/audio/format-utils.h>
 #include <spa/param/buffers.h>
+#include <spa/param/props.h>
+#include <spa/pod/iter.h>
+#include <spa/pod/parser.h>
+
+typedef void (*dl_stream_volume_cb)(void *user, float linear, int muted);
 
 #define POOL 4
 struct dl_pw {
@@ -28,6 +34,10 @@ struct dl_pw {
     bool drained;
     uint64_t submitted, captured, presented, dropped, discontinuities;
     uint64_t latency_ns;
+    float last_linear;
+    bool last_muted;
+    dl_stream_volume_cb volume_cb;
+    void *volume_user;
 };
 
 struct dl_region { uint32_t slot, frames, offset; };
@@ -48,6 +58,34 @@ static void state_changed(void *opaque, enum pw_stream_state old,
 
 static void param_changed(void *opaque, uint32_t id, const struct spa_pod *param) {
     struct dl_pw *p = opaque;
+    if (id == SPA_PARAM_Props && param != NULL) {
+        if (p->direction != 1 || !spa_pod_is_object_type(param, SPA_TYPE_OBJECT_Props)) return;
+        const struct spa_pod_prop *prop;
+        bool changed = false;
+        SPA_POD_OBJECT_FOREACH((const struct spa_pod_object *)param, prop) {
+            if (prop->key == SPA_PROP_channelVolumes) {
+                float volumes[SPA_AUDIO_MAX_CHANNELS];
+                uint32_t count = spa_pod_copy_array(&prop->value, SPA_TYPE_Float, volumes,
+                    SPA_AUDIO_MAX_CHANNELS);
+                if (count > 0) {
+                    float loudest = 0.0f;
+                    for (uint32_t i = 0; i < count; i++) loudest = fmaxf(loudest, volumes[i]);
+                    p->last_linear = loudest;
+                    changed = true;
+                }
+            } else if (prop->key == SPA_PROP_mute) {
+                bool muted = false;
+                if (spa_pod_get_bool(&prop->value, &muted) == 0) {
+                    p->last_muted = muted;
+                    changed = true;
+                }
+            }
+        }
+        if (changed && p->volume_cb != NULL) {
+            p->volume_cb(p->volume_user, p->last_linear, p->last_muted ? 1 : 0);
+        }
+        return;
+    }
     if (id != SPA_PARAM_Format || param == NULL) return;
     struct spa_audio_info_raw info = {0};
     if (spa_format_audio_raw_parse(param, &info) < 0 ||
@@ -153,6 +191,7 @@ int dl_pw_open(uint32_t direction, uint32_t rate, uint32_t channels, uint32_t by
     struct dl_pw *p = calloc(1, sizeof(*p));
     if (!p) return -ENOMEM;
     p->direction = direction; p->rate = rate; p->channels = channels; p->bytes = bytes;
+    p->last_linear = 1.0f; p->last_muted = false;
     memcpy(p->fds, fds, sizeof(p->fds));
     memcpy(p->samples, samples, sizeof(p->samples));
     p->state = PW_STREAM_STATE_UNCONNECTED;
@@ -461,6 +500,39 @@ int dl_pw_position(struct dl_pw *p, struct dl_position *out) {
             * 1000000000 / p->rate + graph_delay_ns;
         *out = (struct dl_position){ frames, ns, p->latency_ns, p->discontinuities };
     } else if (!result) result = -EAGAIN;
+    pw_thread_loop_unlock(p->loop);
+    return result;
+}
+
+void dl_pw_set_volume_callback(struct dl_pw *p, dl_stream_volume_cb cb, void *user) {
+    if (!p) return;
+    pw_thread_loop_lock(p->loop);
+    p->volume_cb = cb;
+    p->volume_user = user;
+    pw_thread_loop_unlock(p->loop);
+}
+
+int dl_pw_set_volume(struct dl_pw *p, float linear, int muted) {
+    if (!p || p->direction != 1) return -EINVAL;
+    if (linear < 0.0f) linear = 0.0f;
+    if (linear > 1.0f) linear = 1.0f;
+    pw_thread_loop_lock(p->loop);
+    int result = p->error ? -p->error : 0;
+    if (!result) {
+        uint32_t ch = (p->channels > 0 && p->channels <= SPA_AUDIO_MAX_CHANNELS) ? p->channels : 2;
+        float volumes[SPA_AUDIO_MAX_CHANNELS];
+        for (uint32_t i = 0; i < ch; i++) volumes[i] = linear;
+        float mute_val = muted ? 1.0f : 0.0f;
+        result = pw_stream_set_control(p->stream, SPA_PROP_mute, 1, &mute_val, 0);
+        if (result >= 0) {
+            result = pw_stream_set_control(p->stream, SPA_PROP_channelVolumes, ch, volumes, 0);
+        }
+        if (result >= 0) {
+            p->last_linear = linear;
+            p->last_muted = muted != 0;
+            result = 0;
+        }
+    }
     pw_thread_loop_unlock(p->loop);
     return result;
 }

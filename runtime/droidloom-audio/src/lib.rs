@@ -2,11 +2,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use droidloom_audio_protocol::*;
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd};
 use std::ptr::NonNull;
-use std::sync::Once;
+use std::sync::{Arc, Mutex, Once, PoisonError};
 
 pub mod volume;
 
@@ -18,7 +18,7 @@ fn init_pipewire() {
 }
 
 /// Host-side authority and routing. Capture defaults to denied in the CLI.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Options {
     /// Kernel-mapped UID allowed to connect to the delegated endpoint.
     pub peer_uid: u32,
@@ -30,6 +30,8 @@ pub struct Options {
     pub remote: Option<String>,
     /// Capture a sink monitor for an explicit loopback test, rather than a microphone.
     pub capture_sink: bool,
+    /// Optional per-stream volume coordinator (used in desktop mode instead of host sink volume).
+    pub stream_volume: Option<Arc<volume::StreamVolumeHub>>,
 }
 
 #[repr(C)]
@@ -47,6 +49,8 @@ struct Position {
     latency_ns: u64,
     discontinuities: u64,
 }
+
+type StreamVolumeCallback = unsafe extern "C" fn(*mut c_void, f32, c_int);
 
 unsafe extern "C" {
     fn dl_pw_init();
@@ -68,10 +72,29 @@ unsafe extern "C" {
     fn dl_pw_submit(stream: *mut c_void, slot: u32, frames: u32) -> i32;
     fn dl_pw_control(stream: *mut c_void, command: u64) -> i32;
     fn dl_pw_position(stream: *mut c_void, position: *mut Position) -> i32;
+    fn dl_pw_set_volume_callback(
+        stream: *mut c_void,
+        cb: StreamVolumeCallback,
+        user: *mut c_void,
+    );
+    fn dl_pw_set_volume(stream: *mut c_void, linear: f32, muted: c_int) -> i32;
+}
+
+unsafe extern "C" fn stream_volume_trampoline(user: *mut c_void, linear: f32, muted: c_int) {
+    if user.is_null() {
+        return;
+    }
+    // SAFETY: `user` is an `Arc<StreamVolumeHub>` raw pointer kept alive until after `dl_pw_destroy`.
+    let hub = unsafe { &*user.cast::<volume::StreamVolumeHub>() };
+    hub.on_stream_changed(linear, muted != 0);
 }
 
 struct Stream {
     native: NonNull<c_void>,
+    generation: u64,
+    handle: Option<Arc<Mutex<Option<usize>>>>,
+    hub: Option<Arc<volume::StreamVolumeHub>>,
+    cb_ctx: Option<*const volume::StreamVolumeHub>,
     // Native stream must be destroyed before any sample mapping or FD is released.
     buffers: Vec<SampleBuffer>,
 }
@@ -119,7 +142,41 @@ impl Stream {
             )
         })?;
         let native = NonNull::new(native).ok_or_else(|| invalid("PipeWire returned no stream"))?;
-        Ok(Self { native, buffers })
+        let mut handle = None;
+        let mut hub_ref = None;
+        let mut cb_ctx = None;
+        if format.direction == Direction::Playback
+            && let Some(hub) = &options.stream_volume
+        {
+            let slot_handle = Arc::new(Mutex::new(Some(native.as_ptr() as usize)));
+            let (initial_linear, initial_muted) =
+                hub.register_stream(generation, Arc::clone(&slot_handle));
+            let raw = Arc::into_raw(Arc::clone(hub));
+            // SAFETY: `raw` remains valid until after `dl_pw_destroy` stops the PipeWire loop.
+            unsafe {
+                dl_pw_set_volume_callback(
+                    native.as_ptr(),
+                    stream_volume_trampoline,
+                    raw.cast_mut().cast(),
+                );
+                let _ = dl_pw_set_volume(
+                    native.as_ptr(),
+                    initial_linear,
+                    c_int::from(initial_muted),
+                );
+            }
+            handle = Some(slot_handle);
+            hub_ref = Some(Arc::clone(hub));
+            cb_ctx = Some(raw);
+        }
+        Ok(Self {
+            native,
+            generation,
+            handle,
+            hub: hub_ref,
+            cb_ctx,
+            buffers,
+        })
     }
     fn acquire(&mut self, requested: u32) -> io::Result<Region> {
         let mut region = Region::default();
@@ -144,9 +201,19 @@ impl Stream {
 }
 impl Drop for Stream {
     fn drop(&mut self) {
-        // SAFETY: unique stream ownership; joins its loop before buffers drop.
+        if let Some(hub) = &self.hub {
+            hub.unregister_stream(self.generation);
+        }
+        if let Some(handle) = &self.handle {
+            *handle.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+        // SAFETY: unique stream ownership; joins its loop before buffers and cb_ctx drop.
         unsafe {
             dl_pw_destroy(self.native.as_ptr());
+        }
+        if let Some(raw) = self.cb_ctx.take() {
+            // SAFETY: `dl_pw_destroy` has already joined the PipeWire thread loop.
+            unsafe { drop(Arc::from_raw(raw)) };
         }
     }
 }

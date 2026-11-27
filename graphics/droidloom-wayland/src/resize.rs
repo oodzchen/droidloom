@@ -1,6 +1,13 @@
 //! Latest window geometry awaiting application after a Wayland dispatch batch.
 
+use std::time::{Duration, Instant};
+
 use droidloom_window_policy::LogicalSize;
+
+/// How long an interactive edge-drag resize must pause before sending the
+/// intermediate geometry to Android and reallocating render targets. Releasing
+/// the drag (`resizing == false`) applies immediately with zero delay.
+pub const INTERACTIVE_RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Configure {
@@ -19,6 +26,7 @@ pub struct Pending {
     size: Option<LogicalSize>,
     scale_120: u32,
     remember: bool,
+    apply_after: Option<Instant>,
 }
 
 impl Pending {
@@ -27,6 +35,7 @@ impl Pending {
             size: None,
             scale_120,
             remember: false,
+            apply_after: None,
         }
     }
 
@@ -37,9 +46,27 @@ impl Pending {
             .or_else(|| applied.map(|(width, height)| LogicalSize { width, height }))
     }
 
+    #[cfg(test)]
     pub fn configure(&mut self, size: LogicalSize, remember: bool) {
         self.size = Some(size);
         self.remember = remember;
+        self.apply_after = None;
+    }
+
+    /// Record a compositor configure. While an interactive border drag is active
+    /// (`resizing == true`), debounce Android task resize and DMA-BUF pool
+    /// reallocation until the drag pauses for [`INTERACTIVE_RESIZE_DEBOUNCE`] or
+    /// finishes (`resizing == false`).
+    pub fn configure_interactive(
+        &mut self,
+        size: LogicalSize,
+        remember: bool,
+        resizing: bool,
+        now: Instant,
+    ) {
+        self.size = Some(size);
+        self.remember = remember;
+        self.apply_after = resizing.then(|| now + INTERACTIVE_RESIZE_DEBOUNCE);
     }
 
     pub fn preferred_scale(&mut self, scale_120: u32, applied: Option<(u32, u32)>) -> bool {
@@ -53,9 +80,25 @@ impl Pending {
         self.size.is_some()
     }
 
+    pub fn deadline(&self) -> Option<Instant> {
+        self.size.and(self.apply_after)
+    }
+
+    pub fn is_due(&self, now: Instant) -> bool {
+        self.size.is_some() && self.apply_after.is_none_or(|due| now >= due)
+    }
+
+    pub fn take_ready(&mut self, now: Instant) -> Option<Configure> {
+        if !self.is_due(now) {
+            return None;
+        }
+        self.take()
+    }
+
     pub fn take(&mut self) -> Option<Configure> {
         let size = self.size.take()?;
         let remember = std::mem::take(&mut self.remember);
+        self.apply_after = None;
         Some(Configure {
             size,
             scale_120: self.scale_120,
@@ -66,6 +109,7 @@ impl Pending {
     pub fn cancel(&mut self) {
         self.size = None;
         self.remember = false;
+        self.apply_after = None;
     }
 }
 
@@ -214,5 +258,50 @@ mod tests {
         work.remove(object);
         assert_eq!(work.pop(RESIZE), None);
         assert!(!work.pending());
+    }
+
+    #[test]
+    fn interactive_drag_debounces_until_pause_or_release() {
+        let start = Instant::now();
+        let mut pending = Pending::new(120);
+        pending.configure_interactive(size(900, 700), false, true, start);
+        assert!(!pending.is_due(start));
+        assert!(pending.take_ready(start + Duration::from_millis(50)).is_none());
+        assert_eq!(pending.deadline(), Some(start + INTERACTIVE_RESIZE_DEBOUNCE));
+
+        // Another drag tick pushes the debounce deadline forward.
+        let tick = start + Duration::from_millis(100);
+        pending.configure_interactive(size(1050, 750), false, true, tick);
+        assert!(pending.take_ready(start + INTERACTIVE_RESIZE_DEBOUNCE).is_none());
+        assert_eq!(pending.deadline(), Some(tick + INTERACTIVE_RESIZE_DEBOUNCE));
+
+        // Pausing past the debounce window makes the latest size ready.
+        let paused = tick + INTERACTIVE_RESIZE_DEBOUNCE;
+        assert!(pending.is_due(paused));
+        assert_eq!(
+            pending.take_ready(paused),
+            Some(Configure {
+                size: size(1050, 750),
+                scale_120: 120,
+                remember: false,
+            })
+        );
+        assert_eq!(pending.deadline(), None);
+
+        // Releasing the drag (resizing == false) applies immediately.
+        let drag2 = paused + Duration::from_millis(10);
+        pending.configure_interactive(size(1100, 800), false, true, drag2);
+        let release = drag2 + Duration::from_millis(20);
+        pending.configure_interactive(size(1120, 810), true, false, release);
+        assert!(pending.is_due(release));
+        assert_eq!(pending.deadline(), None);
+        assert_eq!(
+            pending.take_ready(release),
+            Some(Configure {
+                size: size(1120, 810),
+                scale_120: 120,
+                remember: true,
+            })
+        );
     }
 }

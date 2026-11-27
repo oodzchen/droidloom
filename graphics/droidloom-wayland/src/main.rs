@@ -278,6 +278,9 @@ struct TaskWindow {
     fractional_scale: Option<WpFractionalScaleV1>,
     sync_surface: Option<WpLinuxDrmSyncobjSurfaceV1>,
     logical_size: Option<(u32, u32)>,
+    /// Last non-fullscreen, non-maximized logical size so un-fullscreening or
+    /// un-maximizing restores the window instead of sticking at screen size.
+    restored_logical_size: Option<LogicalSize>,
     buffer_size: (u32, u32),
     applied_scale_120: u32,
     resize: resize::Pending,
@@ -1014,6 +1017,7 @@ impl App {
                 fractional_scale,
                 sync_surface,
                 logical_size: None,
+                restored_logical_size: None,
                 buffer_size: (0, 0),
                 applied_scale_120: FRACTIONAL_SCALE_DENOMINATOR,
                 resize: resize::Pending::new(FRACTIONAL_SCALE_DENOMINATOR),
@@ -1072,19 +1076,35 @@ impl App {
         Ok(())
     }
 
+    fn resize_deadline(&self) -> Option<Instant> {
+        self.tasks
+            .values()
+            .filter(|task| task.accepts_present())
+            .filter_map(|task| task.resize.deadline())
+            .min()
+    }
+
     fn apply_pending_resizes(&mut self, qh: &QueueHandle<Self>) -> Result<(), PresenterError> {
+        let now = Instant::now();
+        for (object, task) in &self.tasks {
+            if task.accepts_present() && task.resize.is_due(now) {
+                self.task_work.mark(*object, readiness::RESIZE);
+            }
+        }
         // Wayland callbacks only replace pending geometry. Apply the final
-        // size/scale before draining Android frames or publishing layer config.
+        // size/scale once ready (immediately for non-drag configures and drag
+        // release, or after a brief pause during interactive edge drags).
         while let Some(object) = self.task_work.pop(readiness::RESIZE) {
             let Some(task) = self.tasks.get_mut(&object) else {
                 continue;
             };
-            let Some(configure) = task.resize.take() else {
-                continue;
-            };
             if !task.accepts_present() {
+                task.resize.cancel();
                 continue;
             }
+            let Some(configure) = task.resize.take_ready(now) else {
+                continue;
+            };
             self.configure_task(qh, object, configure)?;
             if configure.remember {
                 let package = &self
@@ -2017,9 +2037,12 @@ impl App {
                 }
             }
             EndpointAction::SetFullscreen { object, fullscreen } => {
-                // An immersive Android app hid its status bar: ask for the
-                // whole output, as a native fullscreen app would, and give it
-                // back when the app shows the bar again.
+                // Only mobile shells (where a phone status bar otherwise covers
+                // landscape games) map Android status-bar hiding to compositor
+                // fullscreen. On desktops, apps keep their windowed geometry.
+                if self.session_mode != SessionMode::Mobile {
+                    return Ok(());
+                }
                 let task = self
                     .tasks
                     .get_mut(&object)
@@ -2124,8 +2147,12 @@ impl App {
                     .with_lazy_render_targets()
                     .with_scene_presentation()
                     .with_task_density()
-                    .with_task_parents()
-                    .with_task_fullscreen();
+                    .with_task_parents();
+                let endpoint = if self.session_mode == SessionMode::Mobile {
+                    endpoint.with_task_fullscreen()
+                } else {
+                    endpoint
+                };
                 // Only a compositor that reports its keyboard's height lets
                 // Android lay windows out around it.
                 let endpoint = if self
@@ -2742,9 +2769,16 @@ impl WindowHandler for App {
         let task = &self.tasks[&object];
         let package = task.package.clone();
         let previous = task.resize.logical_size(task.logical_size);
+        let restored = task.restored_logical_size;
         let requested_width = configure.new_size.0.map(NonZeroU32::get);
         let requested_height = configure.new_size.1.map(NonZeroU32::get);
-        let size = previous.map_or_else(
+        let fullscreen_or_maximized = configure.is_maximized() || configure.is_fullscreen();
+        let fallback = if fullscreen_or_maximized {
+            previous
+        } else {
+            restored.or(previous)
+        };
+        let size = fallback.map_or_else(
             || {
                 let bounds = configure
                     .suggested_bounds
@@ -2757,21 +2791,22 @@ impl WindowHandler for App {
                     self.host_logical_canvas_size(),
                 )
             },
-            |previous| LogicalSize {
-                width: requested_width.unwrap_or(previous.width),
-                height: requested_height.unwrap_or(previous.height),
+            |fallback| LogicalSize {
+                width: requested_width.unwrap_or(fallback.width),
+                height: requested_height.unwrap_or(fallback.height),
             },
         );
-        let remember = previous.is_some()
-            && !configure.is_resizing()
-            && !configure.is_maximized()
-            && !configure.is_fullscreen();
-        self.tasks
-            .get_mut(&object)
-            .expect("surface has a task")
-            .resize
-            .configure(size, remember);
-        self.task_work.mark(object, readiness::RESIZE);
+        let resizing = configure.is_resizing() && previous.is_some();
+        let remember = previous.is_some() && !resizing && !fullscreen_or_maximized;
+        let task = self.tasks.get_mut(&object).expect("surface has a task");
+        if !fullscreen_or_maximized {
+            task.restored_logical_size = Some(size);
+        }
+        task.resize
+            .configure_interactive(size, remember, resizing, Instant::now());
+        if !resizing {
+            self.task_work.mark(object, readiness::RESIZE);
+        }
     }
 }
 
@@ -3998,6 +4033,7 @@ fn poll_sources(
     let fallback_deadline = app.task_work.deadline(now, RELEASE_POLL_FALLBACK);
     let stall_deadline = app.stalled_scene_deadline();
     let hide_deadline = app.hide_deadline();
+    let resize_deadline = app.resize_deadline();
     // Pending Wayland events must be dispatched before sleeping. The previous
     // fixed timeout masked a missed wakeup here when the socket was drained
     // by another reader but our event queue still contained callbacks.
@@ -4098,6 +4134,7 @@ fn poll_sources(
         .chain(fallback_deadline)
         .chain(stall_deadline)
         .chain(hide_deadline)
+        .chain(resize_deadline)
         .min();
     let timeout = if app.task_work.pending() {
         0 // Flush Wayland first, then service work queued during this turn.

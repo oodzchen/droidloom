@@ -536,46 +536,111 @@ fn read_native(
     generation: &AtomicU64,
     rev: u64,
 ) -> io::Result<Clip> {
-    let mut files = vec![];
-    let mut total = 0;
+    struct PendingPipe {
+        mime: String,
+        input: Option<File>,
+        temp: tempfile::NamedTempFile,
+        size: u64,
+        limit: u64,
+    }
+
+    let mut pending = Vec::with_capacity(pipes.len());
+    for (mime, input) in pipes {
+        let flags = unsafe { libc::fcntl(input.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(input.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let limit = if mime.starts_with("image/") {
+            MAX_BYTES
+        } else {
+            MAX_TEXT as u64
+        };
+        pending.push(PendingPipe {
+            mime,
+            input: Some(input),
+            temp: tempfile::NamedTempFile::new_in(directory.path())?,
+            size: 0,
+            limit,
+        });
+    }
+
     let deadline = Instant::now() + Duration::from_secs(30);
-    for (mime, mut input) in pipes {
-        let mut temp = tempfile::NamedTempFile::new_in(directory.path())?;
-        let mut buffer = [0; 65536];
-        let mut size = 0;
-        loop {
-            if generation.load(Ordering::Acquire) != rev || Instant::now() > deadline {
-                return Err(wire::invalid());
+    let mut buffer = [0; 65536];
+    let mut active_indices = Vec::with_capacity(pending.len());
+    let mut pollfds = Vec::with_capacity(pending.len());
+
+    // Drain all requested MIME pipes concurrently: sources such as GTK3/Firefox may
+    // block writing a large second offer (e.g. image/png) before returning to their
+    // event loop to close an earlier small offer (e.g. text/html).
+    loop {
+        if generation.load(Ordering::Acquire) != rev || Instant::now() > deadline {
+            return Err(wire::invalid());
+        }
+        active_indices.clear();
+        pollfds.clear();
+        for (idx, entry) in pending.iter().enumerate() {
+            if let Some(input) = &entry.input {
+                active_indices.push(idx);
+                pollfds.push(libc::pollfd {
+                    fd: input.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
             }
-            let mut p = libc::pollfd {
-                fd: input.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: one valid pollfd, no retained pointer.
-            let ready = unsafe { libc::poll(&raw mut p, 1, 100) };
-            if ready < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if ready == 0 {
+        }
+        if pollfds.is_empty() {
+            break;
+        }
+        // SAFETY: pollfds points to a valid contiguous slice of pollfd structs.
+        let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 100) };
+        if ready < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            let n = input.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
-            size += n as u64;
-            if size
-                > if mime.starts_with("image/") {
-                    MAX_BYTES
-                } else {
-                    MAX_TEXT as u64
-                }
-            {
-                return Err(wire::invalid());
-            }
-            temp.write_all(&buffer[..n])?;
+            return Err(err);
         }
+        if ready == 0 {
+            continue;
+        }
+        for (pfd, &idx) in pollfds.iter().zip(&active_indices) {
+            if pfd.revents == 0 {
+                continue;
+            }
+            let entry = &mut pending[idx];
+            loop {
+                let Some(input) = entry.input.as_mut() else {
+                    break;
+                };
+                match input.read(&mut buffer) {
+                    Ok(0) => {
+                        entry.input = None;
+                        break;
+                    }
+                    Ok(n) => {
+                        entry.size += n as u64;
+                        if entry.size > entry.limit {
+                            return Err(wire::invalid());
+                        }
+                        entry.temp.write_all(&buffer[..n])?;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+
+    let mut files = vec![];
+    let mut total = 0;
+    for PendingPipe {
+        mime, temp, size, ..
+    } in pending
+    {
         if mime.starts_with("image/") {
             desc.blobs.push(Blob {
                 mime: mime.clone(),
@@ -817,6 +882,40 @@ mod tests {
         }
         let state = mailbox.value.lock().unwrap();
         assert!(matches!(state.0, Some(Outbound::Sync(999))));
+    }
+    #[test]
+    fn concurrent_pipes_do_not_deadlock_when_later_pipe_exceeds_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (html_r, mut html_w) = pipe().unwrap();
+        let (img_r, mut img_w) = pipe().unwrap();
+        let payload = vec![0xABu8; 256 * 1024];
+        let expected_len = payload.len() as u64;
+        let writer = std::thread::spawn(move || {
+            // Simulate GTK3/Firefox: write small text/html without closing its fd yet,
+            // then perform a blocking write larger than the 64 KiB pipe buffer on image/png.
+            html_w.write_all(b"<img src=\"x\">").unwrap();
+            img_w.write_all(&payload).unwrap();
+            drop(img_w);
+            drop(html_w);
+        });
+        let desc = Description {
+            id: "test-concurrent".into(),
+            base: 1,
+            ..Default::default()
+        };
+        let clip = read_native(
+            desc,
+            vec![("text/html".into(), html_r), ("image/png".into(), img_r)],
+            &dir,
+            &AtomicU64::new(1),
+            1,
+        )
+        .unwrap();
+        writer.join().unwrap();
+        assert_eq!(clip.description.html.as_deref(), Some("<img src=\"x\">"));
+        assert_eq!(clip.description.blobs.len(), 1);
+        assert_eq!(clip.description.blobs[0].mime, "image/png");
+        assert_eq!(clip.description.blobs[0].size, expected_len);
     }
 }
 

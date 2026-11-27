@@ -1,0 +1,51 @@
+From: Droidloom development build
+Subject: [PATCH] vold: fall back to statvfs when /data has no fstab entry
+
+Droidloom bind-mounts /data from the host filesystem without a device
+fstab or block device node. When host storage exceeds 512 GB,
+StorageStatsService.getTotalBytes() calls IVold.getStorageSize(), which
+failed with EINVAL ("No mount point entry for /data") and crashed
+Android Settings -> Storage.
+
+Fall back to statvfs("/data") when fstab_default has no /data entry.
+
+diff --git a/VolumeManager.cpp b/VolumeManager.cpp
+index 9846e12..39fa22b 100644
+--- a/VolumeManager.cpp
++++ b/VolumeManager.cpp
+@@ -27,6 +27,7 @@
+ #include <sys/ioctl.h>
+ #include <sys/mount.h>
+ #include <sys/stat.h>
++#include <sys/statvfs.h>
+ #include <sys/sysmacros.h>
+ #include <sys/types.h>
+ #include <sys/wait.h>
+@@ -1384,8 +1385,25 @@ android::status_t android::vold::GetStorageSize(int64_t* storageSize) {
+     // Start with the /data mount point from fs_mgr
+     auto entry = android::fs_mgr::GetEntryForMountPoint(&fstab_default, DATA_MNT_POINT);
+     if (entry == nullptr) {
+-        LOG(ERROR) << "No mount point entry for " << DATA_MNT_POINT;
+-        return EINVAL;
++        // Droidloom bind-mounts /data from the host filesystem without an fstab
++        // entry or block device. Fall back to statvfs(/data) so StorageStatsService
++        // can report capacity on host partitions larger than 512 GB.
++        struct statvfs st;
++        if (statvfs(DATA_MNT_POINT, &st) != 0) {
++            PLOG(ERROR) << "No mount point entry for " << DATA_MNT_POINT
++                        << " and statvfs failed";
++            return EINVAL;
++        }
++        uint64_t blockSize = st.f_frsize != 0 ? st.f_frsize : st.f_bsize;
++        uint64_t totalBytes = 0;
++        if (blockSize == 0 ||
++            __builtin_mul_overflow(static_cast<uint64_t>(st.f_blocks), blockSize, &totalBytes) ||
++            totalBytes == 0 || totalBytes > static_cast<uint64_t>(INT64_MAX)) {
++            LOG(ERROR) << "Invalid statvfs size for " << DATA_MNT_POINT;
++            return EINVAL;
++        }
++        *storageSize = static_cast<int64_t>(totalBytes);
++        return OK;
+     }
+ 
+     status = getDeviceSize(entry->blk_device, storageSize, entry->fs_type == "f2fs");

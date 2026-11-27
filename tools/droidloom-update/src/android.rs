@@ -373,6 +373,10 @@ const PATCHES: &[(&str, &str)] = &[
         "android/aosp-patches/0008-vold-preserve-shared-storage-submounts.patch",
     ),
     (
+        "system/vold",
+        "android/aosp-patches/0040-vold-statvfs-storage-size-fallback.patch",
+    ),
+    (
         "frameworks/base",
         "android/framework/0001-droidloom-bottom-navigation-insets.patch",
     ),

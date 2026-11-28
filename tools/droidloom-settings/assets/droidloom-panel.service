@@ -1,7 +1,8 @@
 [Unit]
 Description=Droidloom Plasma Control Center D-Bus service
 PartOf=graphical-session.target
-After=graphical-session.target
+Requires=droidloom-panel.socket
+After=graphical-session.target droidloom-panel.socket
 
 [Service]
 Type=dbus

@@ -68,19 +68,11 @@ def _refresh_desktop_caches(base: Path, *, clear_kde_icon_cache: bool) -> None:
             pass
 
     if clear_kde_icon_cache:
-        cache_env = os.environ.get("XDG_CACHE_HOME", "").strip()
-        cache_home = Path(cache_env) if cache_env else (Path.home() / ".cache")
-        kcache = cache_home / "icon-cache.kcache"
-        try:
-            if kcache.exists():
-                kcache.unlink()
-        except OSError:
-            pass
-
+        # Refresh KDE desktop caches incrementally without deleting the host's
+        # shared ~/.cache/icon-cache.kcache used by Plasma and desktop apps.
         for tool, args in (
-            ("kbuildsycoca6", ["--noincremental"]),
             ("kbuildsycoca6", []),
-            ("kbuildsycoca5", ["--noincremental"]),
+            ("kbuildsycoca5", []),
         ):
             exe = shutil.which(tool)
             if not exe:

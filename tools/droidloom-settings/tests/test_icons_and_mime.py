@@ -21,6 +21,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from droidloom_settings.backend.mime_assoc import (
     APK_ICON_NAME,
     APK_MIME,
+    _refresh_desktop_caches,
     install_apk_mime_icon,
     is_apk_mime_icon_installed,
     remove_apk_mime_icon,
@@ -134,6 +135,25 @@ class IconsAndMimeTests(unittest.TestCase):
             rem_ok, rem_msg = remove_apk_mime_icon(tmp_path)
             self.assertTrue(rem_ok, rem_msg)
             self.assertFalse(is_apk_mime_icon_installed(tmp_path))
+
+    def test_refresh_desktop_caches_preserves_host_kde_icon_cache(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="dl_kcache_") as tmp:
+            tmp_path = Path(tmp)
+            cache_dir = tmp_path / "cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            kcache = cache_dir / "icon-cache.kcache"
+            kcache.write_bytes(b"host-plasma-cache")
+            old_cache = os.environ.get("XDG_CACHE_HOME")
+            os.environ["XDG_CACHE_HOME"] = str(cache_dir)
+            try:
+                _refresh_desktop_caches(tmp_path / "data", clear_kde_icon_cache=True)
+            finally:
+                if old_cache is None:
+                    os.environ.pop("XDG_CACHE_HOME", None)
+                else:
+                    os.environ["XDG_CACHE_HOME"] = old_cache
+            self.assertTrue(kcache.is_file())
+            self.assertEqual(kcache.read_bytes(), b"host-plasma-cache")
 
 
 if __name__ == "__main__":

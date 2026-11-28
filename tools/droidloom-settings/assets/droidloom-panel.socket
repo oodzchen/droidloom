@@ -1,0 +1,12 @@
+[Unit]
+Description=Droidloom Plasma Control Center native media bridge socket
+PartOf=graphical-session.target
+
+[Socket]
+ListenStream=%t/droidloom/media.sock
+SocketMode=0600
+DirectoryMode=0700
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

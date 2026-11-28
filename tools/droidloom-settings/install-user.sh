@@ -136,6 +136,9 @@ sed "s|@PANEL_DAEMON_EXEC@|$PANEL_DAEMON_BIN|g" \
   "$SCRIPT_DIR/assets/droidloom-panel.service" > "$USER_UNIT_DIR/droidloom-panel.service"
 chmod 0644 "$USER_UNIT_DIR/droidloom-panel.service"
 
+install -m 0644 "$SCRIPT_DIR/assets/droidloom-panel.socket" \
+  "$USER_UNIT_DIR/droidloom-panel.socket"
+
 sed "s|@PANEL_DAEMON_EXEC@|$PANEL_DAEMON_BIN|g" \
   "$SCRIPT_DIR/assets/org.droidloom.ControlCenter.service" > "$DBUS_SERVICE_DIR/org.droidloom.ControlCenter.service"
 chmod 0644 "$DBUS_SERVICE_DIR/org.droidloom.ControlCenter.service"
@@ -166,13 +169,13 @@ fi
 if command -v xdg-mime >/dev/null 2>&1; then
   xdg-mime default org.droidloom.ApkInstaller.desktop "$APK_MIME"
 fi
-rm -f "$CACHE_HOME/icon-cache.kcache"
 if command -v kbuildsycoca6 >/dev/null 2>&1; then
-  kbuildsycoca6 --noincremental >/dev/null 2>&1 || kbuildsycoca6 >/dev/null 2>&1 || true
+  kbuildsycoca6 >/dev/null 2>&1 || true
 fi
 if command -v systemctl >/dev/null 2>&1; then
   systemctl --user daemon-reload >/dev/null 2>&1 || true
   systemctl --user reload dbus.service >/dev/null 2>&1 || true
+  systemctl --user enable --now droidloom-panel.socket >/dev/null 2>&1 || true
   systemctl --user enable --now droidloom-panel.service >/dev/null 2>&1 || true
   if systemctl --user is-active --quiet droidloom-panel.service; then
     systemctl --user restart droidloom-panel.service >/dev/null 2>&1 || true

@@ -9,6 +9,7 @@ import json
 import os
 import re
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -81,6 +82,49 @@ MPRIS_INTROSPECTION_XML = """
 
 _MAX_ART_DOWNLOAD_BYTES = 2 * 1024 * 1024
 _MAX_ART_CACHE_FILES = 60
+_MAX_NATIVE_LINE_BYTES = 4 * 1024 * 1024
+
+
+def _allowed_peer_uids() -> set[int]:
+    return {os.getuid(), 0, 1000}
+
+
+def _acquire_media_listen_socket(
+    socket_path: Path | None = None,
+) -> tuple[socket.socket | None, Path | None]:
+    if socket_path is None:
+        try:
+            listen_pid = int(os.environ.get("LISTEN_PID", "0") or "0")
+            listen_fds = int(os.environ.get("LISTEN_FDS", "0") or "0")
+        except ValueError:
+            listen_pid, listen_fds = 0, 0
+        if listen_pid == os.getpid() and listen_fds >= 1:
+            try:
+                sock = socket.socket(fileno=3)
+                os.set_inheritable(sock.fileno(), False)
+                sock.settimeout(1.0)
+                return sock, None
+            except OSError:
+                pass
+
+    target = socket_path
+    if target is None:
+        rt = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+        base = Path(rt) if rt and Path(rt).is_absolute() else Path(f"/run/user/{os.getuid()}")
+        target = base / "droidloom/media.sock"
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(target.parent, 0o700)
+        target.unlink(missing_ok=True)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(str(target))
+        os.chmod(target, 0o600)
+        sock.listen(4)
+        sock.settimeout(1.0)
+        return sock, target
+    except OSError:
+        return None, None
 
 
 def _is_safe_remote_art_url(url: str) -> bool:
@@ -931,32 +975,62 @@ def _find_dex_path() -> Path | None:
 class AndroidMprisBridgeManager:
     """Supervises Android MediaSession bridge and dynamic per-app MPRIS 2 D-Bus players."""
 
-    def __init__(self, controller: Any) -> None:
+    def __init__(self, controller: Any, *, media_socket_path: Path | None = None) -> None:
         from gi.repository import GLib
 
         self._GLib = GLib
         self._controller = controller
+        self._media_socket_path = media_socket_path
         self._art_cache = MediaArtCache()
         self._players: dict[str, MprisPlayerInstance] = {}
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._native_thread: threading.Thread | None = None
         self._proc: subprocess.Popen[str] | None = None
         self._proc_lock = threading.Lock()
+        self._native_conn: socket.socket | None = None
+        self._native_lock = threading.Lock()
+        self._native_connected = threading.Event()
+        self._listen_sock: socket.socket | None = None
+        self._owned_sock_path: Path | None = None
         self._pushed_key: tuple[str, str] | None = None
         self._fallback_mode = False
 
     def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
         self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._supervisor_loop, daemon=True, name="dl-mpris-bridge"
-        )
-        self._thread.start()
+        if self._native_thread is None or not self._native_thread.is_alive():
+            self._native_thread = threading.Thread(
+                target=self._native_socket_loop, daemon=True, name="dl-mpris-native"
+            )
+            self._native_thread.start()
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(
+                target=self._supervisor_loop, daemon=True, name="dl-mpris-bridge"
+            )
+            self._thread.start()
 
     def close(self) -> None:
         self._stop_event.set()
         self._send_bridge_command({"cmd": "quit"})
+        with self._native_lock:
+            nconn = self._native_conn
+            self._native_conn = None
+        self._native_connected.clear()
+        if nconn is not None:
+            try:
+                nconn.close()
+            except OSError:
+                pass
+        lsock = self._listen_sock
+        self._listen_sock = None
+        if lsock is not None:
+            try:
+                lsock.close()
+            except OSError:
+                pass
+        if self._owned_sock_path is not None:
+            self._owned_sock_path.unlink(missing_ok=True)
+            self._owned_sock_path = None
         with self._proc_lock:
             proc = self._proc
         if proc is not None and proc.poll() is None:
@@ -976,10 +1050,106 @@ class AndroidMprisBridgeManager:
         self._players.clear()
         return False
 
+    def _terminate_adb_proc(self) -> None:
+        with self._proc_lock:
+            proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    def _native_socket_loop(self) -> None:
+        listen_sock, owned_path = _acquire_media_listen_socket(self._media_socket_path)
+        if listen_sock is None:
+            return
+        self._listen_sock = listen_sock
+        self._owned_sock_path = owned_path
+        allowed_uids = _allowed_peer_uids()
+        ucred_size = struct.calcsize("3i")
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    conn, _ = listen_sock.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+
+                try:
+                    raw_cred = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, ucred_size)
+                    _pid, peer_uid, _gid = struct.unpack("3i", raw_cred)
+                    if peer_uid not in allowed_uids:
+                        conn.close()
+                        continue
+                except OSError:
+                    conn.close()
+                    continue
+
+                conn.settimeout(None)
+                with self._native_lock:
+                    prev = self._native_conn
+                    self._native_conn = conn
+                if prev is not None and prev is not conn:
+                    try:
+                        prev.close()
+                    except OSError:
+                        pass
+                self._native_connected.set()
+                self._terminate_adb_proc()
+
+                try:
+                    reader = conn.makefile("rb")
+                    while not self._stop_event.is_set():
+                        raw_line = reader.readline(_MAX_NATIVE_LINE_BYTES + 1)
+                        if not raw_line or len(raw_line) > _MAX_NATIVE_LINE_BYTES:
+                            break
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line or not line.startswith("{"):
+                            continue
+                        try:
+                            payload = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if payload.get("event") == "sessions":
+                            self._GLib.idle_add(self._apply_sessions_payload, payload)
+                except OSError:
+                    pass
+                finally:
+                    with self._native_lock:
+                        if self._native_conn is conn:
+                            self._native_conn = None
+                            self._native_connected.clear()
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                    self._GLib.idle_add(self._clear_all_players)
+        finally:
+            if self._listen_sock is listen_sock:
+                self._listen_sock = None
+                try:
+                    listen_sock.close()
+                except OSError:
+                    pass
+            if self._owned_sock_path is not None:
+                self._owned_sock_path.unlink(missing_ok=True)
+                self._owned_sock_path = None
+
     def _supervisor_loop(self) -> None:
         helper_failures = 0
         while not self._stop_event.is_set():
             try:
+                if (
+                    self._native_connected.is_set()
+                    or os.environ.get("DROIDLOOM_MPRIS_ADB_FALLBACK") == "0"
+                ):
+                    self._stop_event.wait(2.0)
+                    continue
                 status_resp = self._controller.client.status()
                 if status_resp.state != "running":
                     self._GLib.idle_add(self._clear_all_players)
@@ -1153,12 +1323,21 @@ class AndroidMprisBridgeManager:
         return False
 
     def _send_bridge_command(self, cmd: dict[str, Any]) -> bool:
+        data = (json.dumps(cmd, ensure_ascii=False) + "\n").encode("utf-8")
+        with self._native_lock:
+            nconn = self._native_conn
+            if nconn is not None:
+                try:
+                    nconn.sendall(data)
+                    return True
+                except OSError:
+                    pass
         with self._proc_lock:
             proc = self._proc
             if proc is None or proc.poll() is not None or proc.stdin is None:
                 return False
             try:
-                proc.stdin.write(json.dumps(cmd, ensure_ascii=False) + "\n")
+                proc.stdin.write(data.decode("utf-8"))
                 proc.stdin.flush()
                 return True
             except Exception:

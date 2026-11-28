@@ -84,11 +84,19 @@ Droidloom's core architecture is well-suited for desktop integration and does no
    - *Impact*: Prevents Android apps with storage permission from reading or modifying host files/executables in `~/Documents`, `~/Pictures`, `~/Music`, `~/Videos`, and `~/Downloads`, and avoids mutating `setgid` bits on standard host XDG folders.
    - *Trade-off*: Android apps can only access files explicitly placed into configured `shared_storage_directories` (e.g., `~/Downloads/Droidloom`) unless the user opts back into `share_user_folders`.
 
-### Phase 3 — Security & Sidecar Consolidation (Long-Term)
+### Phase 3 — Security & Sidecar Consolidation (In Progress)
 
-1. **Full container User Namespace & dedicated SELinux domain**:
+1. **Host D-Bus & KDE global cache hardening (Phase 3a — Implemented)**:
+   - *Change*: Restricted `packaging/fedora/braun/org.braun.conf` from `context="default"` to `at_console="true"`, and updated `mime_assoc.py` / `install-user.sh` to refresh KDE caches incrementally without deleting `~/.cache/icon-cache.kcache`.
+   - *Impact*: Prevents non-console background services from probing `org.braun.Camera1` and avoids wiping the host desktop's shared KDE icon cache during `.apk` MIME updates.
+   - *Trade-off*: Headless SSH/remote sessions without a local console seat cannot invoke `org.braun.Camera1` over system D-Bus; KDE icon cache refreshes rely on `gtk-update-icon-cache` and incremental `kbuildsycoca6`.
+2. **Native Unix-socket media bridge foundation (Phase 3b-1 — Implemented)**:
+   - *Change*: Added `droidloom-panel.socket` (`%t/droidloom/media.sock`, `0600`), wired `droidloom.service` ordering and `droidloom-supervisor` bind-mounting into `/dev/socket/droidloom-framework-host/media`, and upgraded `mpris_bridge.py` (`AndroidMprisBridgeManager`) to accept systemd `LISTEN_FDS` / `AF_UNIX` connections with `SO_PEERCRED` UID verification and a 4 MiB line cap (retiring `adb shell` automatically once connected).
+   - *Impact*: Establishes the authenticated, systemd-owned Unix-socket transport for MPRIS2 media metadata/control without needing ADB once Android-side `HostChannel.MEDIA` is wired.
+   - *Trade-off*: Until Phase 3b-2 adds the Android-side `HostChannel.MEDIA` + `DroidloomSystemUI` bridge, `mpris_bridge.py` keeps the existing `adb shell` session as fallback (`DROIDLOOM_MPRIS_ADB_FALLBACK=0` disables fallback).
+3. **Android-side `MediaSessionBridge` over `HostChannel.MEDIA` (Phase 3b-2 — Planned)**:
+   - *Plan*: Add `HostChannel.MEDIA` (`channel = 6`) in `DroidloomHostChannels.java` / `HostChannel.java` and move `MediaSession` bridging into `DroidloomSystemUI`, retiring the `adb push` / `app_process` fallback completely.
+   - *Trade-off*: Requires rebuilding and deploying `services.jar` + `SystemUI.apk` overrides.
+4. **Full container User Namespace & dedicated SELinux domain (Phase 3c — Planned)**:
    - *Plan*: Enable full subordinate UID/GID mapping across the entire cell (eliminating host UID 0 capabilities and UID 1000 overlap) and confine Fedora SELinux rules to dedicated Droidloom domains instead of `unconfined_t`.
    - *Trade-off*: Requires updating `SO_PEERCRED` UID translation across host brokers and regenerating/migrating existing Android `/data` ownership.
-2. **Replace ADB-based Python daemons with typed Unix-socket brokers**:
-   - *Plan*: Replace `mpris_bridge.py`'s persistent `adb shell` link with a native Rust broker over a dedicated `HostChannel` socket, matching `notifications` and `clipboard`.
-   - *Trade-off*: Higher initial implementation effort in SystemUI/framework and Rust, in exchange for removing ADB runtime dependencies and unifying lifecycle/security enforcement.

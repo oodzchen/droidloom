@@ -2132,6 +2132,7 @@ fn create_private_dev(spec: &CellSpec, root: &Path) -> Result<(), DevelopmentErr
     for name in [
         "clipboard",
         "notifications",
+        "media",
         "audio",
         "gpu",
         "haptics",

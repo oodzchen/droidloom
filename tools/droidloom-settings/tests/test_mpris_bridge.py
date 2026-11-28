@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -20,6 +22,7 @@ from droidloom_settings.backend.mpris_bridge import (
     MPRIS_IFACE_PLAYER,
     MPRIS_IFACE_ROOT,
     MPRIS_OBJECT_PATH,
+    AndroidMprisBridgeManager,
     MediaArtCache,
     MprisPlayerInstance,
     _is_safe_remote_art_url,
@@ -349,6 +352,64 @@ class MprisBridgeTests(unittest.TestCase):
             called: list[str] = []
             cache.fetch_remote_async("https://93.184.216.34/cover.png", lambda u, _l: called.append(u))
             self.assertEqual(called, [])
+
+    def test_native_unix_socket_sessions_and_commands(self) -> None:
+        class _DummyController:
+            pass
+
+        with tempfile.TemporaryDirectory(prefix="dl_media_sock_") as tmp:
+            sock_path = Path(tmp) / "media.sock"
+            received: list[dict[str, object]] = []
+            got_payload = threading.Event()
+            old_fb = os.environ.get("DROIDLOOM_MPRIS_ADB_FALLBACK")
+            os.environ["DROIDLOOM_MPRIS_ADB_FALLBACK"] = "0"
+            mgr = AndroidMprisBridgeManager(_DummyController(), media_socket_path=sock_path)
+            mgr._apply_sessions_payload = lambda payload: (
+                received.append(payload),
+                got_payload.set(),
+                False,
+            )[-1]
+            mgr._GLib = type(
+                "_FakeGLib",
+                (),
+                {"idle_add": staticmethod(lambda fn, *a: fn(*a))},
+            )()
+            mgr.start()
+            try:
+                deadline = time.monotonic() + 3.0
+                while not sock_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(sock_path.exists())
+
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                    client.settimeout(3.0)
+                    client.connect(str(sock_path))
+                    client.sendall(b'{"event":"ready"}\n')
+                    sample = {
+                        "event": "sessions",
+                        "now_elapsed_ms": 1000,
+                        "sessions": [{"package": "com.example.music", "status": "Playing"}],
+                    }
+                    client.sendall((json.dumps(sample) + "\n").encode("utf-8"))
+                    self.assertTrue(got_payload.wait(timeout=3.0))
+                    self.assertEqual(received[0]["sessions"][0]["package"], "com.example.music")
+
+                    self.assertTrue(
+                        mgr._send_bridge_command(
+                            {"cmd": "play_pause", "package": "com.example.music"}
+                        )
+                    )
+                    line = client.makefile("rb").readline(4096).decode("utf-8").strip()
+                    self.assertEqual(
+                        json.loads(line),
+                        {"cmd": "play_pause", "package": "com.example.music"},
+                    )
+            finally:
+                mgr.close()
+                if old_fb is None:
+                    os.environ.pop("DROIDLOOM_MPRIS_ADB_FALLBACK", None)
+                else:
+                    os.environ["DROIDLOOM_MPRIS_ADB_FALLBACK"] = old_fb
 
 
 if __name__ == "__main__":

@@ -753,6 +753,12 @@ impl App {
         Ok(())
     }
 
+    const FALLBACK_CANVAS_SIZE: (u32, u32) = (1920, 1080);
+
+    fn effective_bootstrap_canvas_size(&self) -> (u32, u32) {
+        self.host_canvas_size().unwrap_or(Self::FALLBACK_CANVAS_SIZE)
+    }
+
     fn host_canvas_size(&self) -> Option<(u32, u32)> {
         self.output_state
             .outputs()
@@ -1058,11 +1064,7 @@ impl App {
             // desktop canvas. wl_output mode dimensions are already physical
             // pixels, equivalent to logical output size multiplied by its
             // scale, so do not apply the scale a second time here.
-            let (width, height) = self
-                .host_canvas_size()
-                .ok_or(PresenterError::Configuration(
-                    "Wayland output has no current pixel mode",
-                ))?;
+            let (width, height) = self.effective_bootstrap_canvas_size();
             self.configure_task(
                 qh,
                 object,
@@ -3935,8 +3937,15 @@ fn run() -> Result<(), PresenterError> {
     };
     app.text_input.bind_panel_feedback(&globals, &qh);
     app.dmabuf_state.get_default_feedback(&qh)?;
-    while app.feedback.is_none() || app.host_canvas_size().is_none() {
+    event_queue.roundtrip(&mut app)?;
+    while app.feedback.is_none() {
         event_queue.blocking_dispatch(&mut app)?;
+    }
+    if app.host_canvas_size().is_none() {
+        let (w, h) = app.effective_bootstrap_canvas_size();
+        eprintln!(
+            "Droidloom: no active Wayland output yet; using fallback bootstrap canvas {w}x{h} until an output appears"
+        );
     }
     notify_ready()?;
 

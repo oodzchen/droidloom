@@ -2,14 +2,15 @@
 Description=Droidloom Android application runtime
 PartOf=graphical-session.target
 After=graphical-session-pre.target wayland-session-waitenv.service
-Wants=droidloom-applications.service droidloom-audio.socket droidloom-gpu.socket droidloom-devices.socket droidloom-recovery.service
-After=droidloom-audio.socket droidloom-gpu.socket droidloom-devices.socket
+Wants=droidloom-applications.service droidloom-audio.socket droidloom-gpu.socket droidloom-devices.socket droidloom-panel.socket droidloom-recovery.service
+After=droidloom-audio.socket droidloom-gpu.socket droidloom-devices.socket droidloom-panel.socket
 ConditionPathExists=/etc/droidloom/cell.json
 
 [Service]
 Type=notify
 NotifyAccess=main
-EnvironmentFile=/usr/lib/environment.d/60-droidloom.conf
+EnvironmentFile=-/etc/droidloom/runtime.env
+EnvironmentFile=-/usr/lib/environment.d/60-droidloom.conf
 Environment=DROIDLOOM_MODE=desktop
 EnvironmentFile=-%t/droidloom/session.env
 EnvironmentFile=-%h/.config/droidloom/clipboard.env

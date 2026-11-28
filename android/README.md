@@ -40,7 +40,7 @@ Java/Kotlin code, Android services and Mesa stay native. The proxies call the
 native Android EGL/GLES/Vulkan libraries, with no emulator graphics driver.
 This first integration does not enable ARM32, RenderScript or transparent
 execution of standalone ARM ELF programs. It leaves host binfmt registrations
-untouched. Broad application compatibility and performance remain experimental.
+untouched. Broad application compatibility and performance remain experimental. See [Native bridge ABI compatibility](../docs/native-bridge-abi-compat.md) for why native `x86_64` APKs are preferred over `arm64-v8a` builds and for the deferred per-app ABI view alignment design.
 
 The initial workstation smoke test used TikTok 46.8.2 (ARM64, version code
 2024608020). Its APKM splits installed through a PackageManager session and its

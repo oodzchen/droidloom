@@ -9,6 +9,7 @@
 - [Desktop integration](desktop-integration.md): windows, clipboard, notifications and diagnostics.
 - [Native application integration proposal](native-app-integration.md): system-service backends and ordinary Linux application behavior.
 - [Audio bridge and remaining work](audio-integration-proposal.md).
+- [Native bridge ABI compatibility](native-bridge-abi-compat.md): per-app ARM64 ABI view alignment notes and native `x86_64` preference.
 - [Security requirements](threat-model-v2.md): trust boundaries and isolation limitations.
 - [Host isolation and desktop boundaries](host-isolation.md): host-conflict audit, phased hardening, and trade-offs.
 

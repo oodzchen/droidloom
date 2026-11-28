@@ -411,8 +411,10 @@ class ControlCenterService:
         refresh_notifications: bool = False,
         refresh_tasks: bool = False,
         refresh_state: bool = False,
+        emit_apps_if_changed: bool = False,
     ) -> None:
         def wrapped() -> dict[str, Any]:
+            rev_before = self.controller.apps_revision
             ok, msg = fn()
             extra: dict[str, Any] = {"ok": bool(ok), "message": str(msg)}
             if refresh_notifications:
@@ -421,6 +423,8 @@ class ControlCenterService:
                 extra["tasks"] = self.controller.get_tasks()
             if refresh_state:
                 extra["state"] = self.controller.get_state()
+            if emit_apps_if_changed and self.controller.apps_revision != rev_before:
+                extra["apps"] = {"connected": True, "apps": self.controller.cached_apps()}
             return extra
 
         fut = self._pool.submit(wrapped)
@@ -471,6 +475,13 @@ class ControlCenterService:
                             "(s)", (json.dumps(res["state"], ensure_ascii=False),)
                         ),
                     )
+                if "apps" in res:
+                    self._emit(
+                        "AppsChanged",
+                        self._GLib.Variant(
+                            "(s)", (json.dumps(res["apps"], ensure_ascii=False),)
+                        ),
+                    )
                 return False
 
             self._GLib.idle_add(_idle)
@@ -500,7 +511,7 @@ class ControlCenterService:
             self._reply_json(invocation, lambda: self.controller.get_apps(force))
         elif method_name == "RefreshAll":
             def work() -> dict[str, Any]:
-                apps = self.controller.get_apps(False)
+                apps = self.controller.get_apps(True)
                 notif = self.controller.get_notifications()
                 tasks = self.controller.get_tasks(False)
                 state = self.controller.get_state()
@@ -537,7 +548,10 @@ class ControlCenterService:
         elif method_name == "LaunchApp":
             pkg, comp = str(args[0]), str(args[1])
             self._reply_action(
-                invocation, f"launch:{pkg}", lambda: self.controller.launch_app(pkg, comp)
+                invocation,
+                f"launch:{pkg}",
+                lambda: self.controller.launch_app(pkg, comp),
+                emit_apps_if_changed=True,
             )
         elif method_name == "StopApp":
             pkg = str(args[0])

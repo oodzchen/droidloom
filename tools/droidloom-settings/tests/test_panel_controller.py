@@ -21,7 +21,7 @@ from droidloom_settings.backend.android_bridge import (
     parse_dumpsys_notifications,
     parse_running_tasks_and_services,
 )
-from droidloom_settings.backend.control_client import ControlResponse
+from droidloom_settings.backend.control_client import ControlError, ControlResponse
 from droidloom_settings.backend.panel_controller import (
     PanelController,
     encode_rgba_hex_to_png,
@@ -403,6 +403,213 @@ ACTIVITY MANAGER RECENT TASKS (dumpsys activity recents)
             self.assertEqual(task["name"], "Settings")
             self.assertEqual(task["component"], "com.android.settings/com.android.settings.Settings")
             self.assertTrue(task["icon_path"].startswith("file://"))
+
+    def test_get_apps_auto_invalidates_when_catalog_manifest_changes(self) -> None:
+        class _UpdatingClient(_FakeClient):
+            def __init__(self) -> None:
+                self.list_calls = 0
+                self.comp = "com.netease.cloudmusic/.activity.IconChangeDefaultAlias"
+
+            def list_applications(self):
+                self.list_calls += 1
+                return [
+                    {
+                        "name": "NetEase Music",
+                        "package": "com.netease.cloudmusic",
+                        "component": self.comp,
+                    }
+                ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            state_dir = t / "state"
+            apps_dir = t / "apps"
+            state_dir.mkdir(parents=True)
+            apps_dir.mkdir(parents=True)
+            manifest = state_dir / "application-catalog-v1.json"
+            manifest.write_text('{"schema": 1, "applications": {"old": {}}}', encoding="utf-8")
+
+            client = _UpdatingClient()
+            ctrl = PanelController(
+                client=client,
+                cache_dir=t / "cache",
+                config_dir=t / "cfg",
+                apps_dir=apps_dir,
+                state_dir=state_dir,
+            )
+
+            res1 = ctrl.get_apps(False)
+            res2 = ctrl.get_apps(False)
+            self.assertEqual(client.list_calls, 1)
+            self.assertEqual(
+                res1["apps"][0]["component"],
+                "com.netease.cloudmusic/.activity.IconChangeDefaultAlias",
+            )
+            self.assertEqual(res2, res1)
+
+            client.comp = "com.netease.cloudmusic/.activity.LoadingActivity"
+            manifest.write_text(
+                '{"schema": 1, "applications": {"new": {"component": "LoadingActivity"}}}',
+                encoding="utf-8",
+            )
+            st = manifest.stat()
+            os.utime(manifest, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+
+            res3 = ctrl.get_apps(False)
+            self.assertEqual(client.list_calls, 2)
+            self.assertEqual(
+                res3["apps"][0]["component"],
+                "com.netease.cloudmusic/.activity.LoadingActivity",
+            )
+
+    def test_get_apps_clears_cache_when_stopped(self) -> None:
+        class _RestartingClient(_FakeClient):
+            def __init__(self) -> None:
+                self.running = True
+                self.comp = "com.netease.cloudmusic/.activity.IconChangeDefaultAlias"
+
+            def status(self):
+                return ControlResponse(
+                    ok=True,
+                    state="running" if self.running else "stopped",
+                    message="ok",
+                )
+
+            def list_applications(self):
+                return [
+                    {
+                        "name": "NetEase Music",
+                        "package": "com.netease.cloudmusic",
+                        "component": self.comp,
+                    }
+                ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            client = _RestartingClient()
+            ctrl = PanelController(
+                client=client,
+                cache_dir=t / "cache",
+                config_dir=t / "cfg",
+                apps_dir=t / "apps",
+                state_dir=t / "state",
+            )
+            res1 = ctrl.get_apps(False)
+            self.assertEqual(
+                res1["apps"][0]["component"],
+                "com.netease.cloudmusic/.activity.IconChangeDefaultAlias",
+            )
+
+            client.running = False
+            stopped = ctrl.get_apps(False)
+            self.assertFalse(stopped["connected"])
+            self.assertEqual(stopped["apps"], [])
+
+            client.running = True
+            client.comp = "com.netease.cloudmusic/.activity.LoadingActivity"
+            res2 = ctrl.get_apps(False)
+            self.assertTrue(res2["connected"])
+            self.assertEqual(
+                res2["apps"][0]["component"],
+                "com.netease.cloudmusic/.activity.LoadingActivity",
+            )
+
+    def test_launch_app_recovers_from_stale_component(self) -> None:
+        class _LaunchRecoveryClient(_FakeClient):
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str | None]] = []
+                self.catalog_comp = "com.netease.cloudmusic/.activity.LoadingActivity"
+                self.fail_on_stale = True
+                self.fail_daemon = False
+
+            def list_applications(self):
+                if self.fail_daemon:
+                    raise ControlError("Droidloom daemon is not running")
+                return [
+                    {
+                        "name": "NetEase Music",
+                        "package": "com.netease.cloudmusic",
+                        "component": self.catalog_comp,
+                    }
+                ]
+
+            def launch(self, package, component=None, resolution=None):
+                self.calls.append((package, component))
+                if self.fail_daemon:
+                    raise ControlError("Droidloom daemon is not running")
+                if self.fail_on_stale and component == "com.netease.cloudmusic/.activity.IconChangeDefaultAlias":
+                    raise ControlError("Activity start failed: -92")
+                return ControlResponse(ok=True, state="running", message=f"launched {package}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            # Case 1: refreshed catalog provides updated component
+            client1 = _LaunchRecoveryClient()
+            ctrl1 = PanelController(
+                client=client1,
+                cache_dir=t / "c1",
+                config_dir=t / "cfg1",
+                apps_dir=t / "apps1",
+                state_dir=t / "state1",
+            )
+            rev_before = ctrl1.apps_revision
+            ok1, _ = ctrl1.launch_app(
+                "com.netease.cloudmusic",
+                "com.netease.cloudmusic/.activity.IconChangeDefaultAlias",
+            )
+            self.assertTrue(ok1)
+            self.assertEqual(ctrl1.apps_revision, rev_before + 1)
+            self.assertEqual(
+                client1.calls,
+                [
+                    ("com.netease.cloudmusic", "com.netease.cloudmusic/.activity.IconChangeDefaultAlias"),
+                    ("com.netease.cloudmusic", "com.netease.cloudmusic/.activity.LoadingActivity"),
+                ],
+            )
+
+            # Case 2: catalog still lacks a different component -> fallback to package-only (None)
+            client2 = _LaunchRecoveryClient()
+            client2.catalog_comp = "com.netease.cloudmusic/.activity.IconChangeDefaultAlias"
+            ctrl2 = PanelController(
+                client=client2,
+                cache_dir=t / "c2",
+                config_dir=t / "cfg2",
+                apps_dir=t / "apps2",
+                state_dir=t / "state2",
+            )
+            ok2, _ = ctrl2.launch_app(
+                "com.netease.cloudmusic",
+                "com.netease.cloudmusic/.activity.IconChangeDefaultAlias",
+            )
+            self.assertTrue(ok2)
+            self.assertEqual(
+                client2.calls,
+                [
+                    ("com.netease.cloudmusic", "com.netease.cloudmusic/.activity.IconChangeDefaultAlias"),
+                    ("com.netease.cloudmusic", None),
+                ],
+            )
+
+            # Case 3: unrelated daemon error -> no fallback retry
+            client3 = _LaunchRecoveryClient()
+            client3.fail_daemon = True
+            ctrl3 = PanelController(
+                client=client3,
+                cache_dir=t / "c3",
+                config_dir=t / "cfg3",
+                apps_dir=t / "apps3",
+                state_dir=t / "state3",
+            )
+            ok3, msg3 = ctrl3.launch_app(
+                "com.netease.cloudmusic",
+                "com.netease.cloudmusic/.activity.IconChangeDefaultAlias",
+            )
+            self.assertFalse(ok3)
+            self.assertIn("not running", msg3)
+            self.assertEqual(
+                client3.calls,
+                [("com.netease.cloudmusic", "com.netease.cloudmusic/.activity.IconChangeDefaultAlias")],
+            )
 
 
 if __name__ == "__main__":

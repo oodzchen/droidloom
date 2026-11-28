@@ -51,7 +51,25 @@ from .user_configs import (
     save_panel_config,
     save_session_mode,
     xdg_applications_dir,
+    xdg_state_dir,
 )
+
+
+def _is_stale_component_error(exc: Exception) -> bool:
+    """Return whether a launch failure indicates a missing or obsolete component."""
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "activity start failed: -92",
+            "activity start failed: -91",
+            "start_class_not_found",
+            "start_intent_not_resolved",
+            "does not belong to package",
+            "has no launcher activity",
+            "unable to find explicit activity class",
+        )
+    )
 
 
 def _xdg_cache_dir() -> Path:
@@ -147,16 +165,51 @@ class PanelController:
         config_dir: Path | None = None,
         apps_dir: Path | None = None,
         notif_bridge: Any | None = None,
+        state_dir: Path | None = None,
     ) -> None:
         self.client = client or ControlClient()
         self.cache_dir = cache_dir or _xdg_cache_dir()
         self.config_dir = config_dir
         self.apps_dir = apps_dir
+        self.state_dir = state_dir
         self.notif_bridge = notif_bridge
         self._apps_cache: list[dict[str, Any]] = []
         self._pkg_meta: dict[str, dict[str, Any]] = {}
+        self._catalog_stamp: tuple[tuple[int, int, int] | None, tuple[int, int] | None] | None = None
+        self._apps_revision: int = 0
         self._last_notifications: list[dict[str, Any]] = []
         self._locally_dismissed: dict[str, int] = {}
+
+    @property
+    def apps_revision(self) -> int:
+        return self._apps_revision
+
+    def cached_apps(self) -> list[dict[str, Any]]:
+        return list(self._apps_cache)
+
+    def _catalog_fingerprint(
+        self,
+    ) -> tuple[tuple[int, int, int] | None, tuple[int, int] | None]:
+        manifest_path = (self.state_dir or xdg_state_dir()) / "application-catalog-v1.json"
+        try:
+            st = manifest_path.stat()
+            manifest_sig: tuple[int, int, int] | None = (st.st_mtime_ns, st.st_size, st.st_ino)
+        except OSError:
+            manifest_sig = None
+
+        apps_path = self.apps_dir or xdg_applications_dir()
+        try:
+            st = apps_path.stat()
+            apps_sig: tuple[int, int] | None = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            apps_sig = None
+
+        return (manifest_sig, apps_sig)
+
+    def _clear_app_catalog_cache(self) -> None:
+        self._apps_cache = []
+        self._pkg_meta = {}
+        self._catalog_stamp = None
 
     def _cell_spec(self) -> dict[str, Any]:
         try:
@@ -209,7 +262,8 @@ class PanelController:
         return target.as_uri()
 
     def _ensure_app_catalog(self, force_refresh: bool = False) -> list[dict[str, Any]]:
-        if self._apps_cache and not force_refresh:
+        current_stamp = self._catalog_fingerprint()
+        if self._apps_cache and not force_refresh and self._catalog_stamp == current_stamp:
             return self._apps_cache
         desktop_icons = _scan_desktop_icons(self.apps_dir)
         apps: list[dict[str, Any]] = []
@@ -251,8 +305,11 @@ class PanelController:
                     item["icon_path"] = self._cache_png(f"app:{comp}", fetched[comp])
 
         apps.sort(key=lambda a: (a["name"].lower(), a["package"]))
+        if apps != self._apps_cache:
+            self._apps_revision += 1
         self._apps_cache = apps
         self._pkg_meta = {a["package"]: a for a in apps}
+        self._catalog_stamp = current_stamp
         return self._apps_cache
 
     def _app_label_and_icon(self, package: str) -> tuple[str, str, str]:
@@ -453,17 +510,32 @@ class PanelController:
     def get_apps(self, force_refresh: bool = False) -> dict[str, Any]:
         status_resp = self.client.status()
         if status_resp.state != "running":
+            self._clear_app_catalog_cache()
             return {"connected": False, "apps": []}
         apps = self._ensure_app_catalog(force_refresh=force_refresh)
         return {"connected": True, "apps": apps}
 
     def launch_app(self, package: str, component: str = "") -> tuple[bool, str]:
+        comp = component.strip() or None
         try:
-            comp = component.strip() or None
             resp = self.client.launch(package, component=comp)
             return True, resp.message or f"已启动 {package}"
         except ControlError as exc:
-            return False, str(exc)
+            if comp is None:
+                return False, str(exc)
+            self._ensure_app_catalog(force_refresh=True)
+            fresh_comp = str((self._pkg_meta.get(package) or {}).get("component") or "").strip()
+            if fresh_comp and fresh_comp != comp:
+                retry_comp: str | None = fresh_comp
+            elif _is_stale_component_error(exc):
+                retry_comp = None
+            else:
+                return False, str(exc)
+            try:
+                resp = self.client.launch(package, component=retry_comp)
+                return True, resp.message or f"已启动 {package}"
+            except ControlError as retry_exc:
+                return False, str(retry_exc)
 
     def stop_app(self, package: str) -> tuple[bool, str]:
         try:

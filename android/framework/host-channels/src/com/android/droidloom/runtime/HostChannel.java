@@ -16,7 +16,7 @@ import java.io.OutputStream;
 public final class HostChannel implements AutoCloseable {
     public static final String BUILD_ABI = "DROIDLOOM_HOST_CHANNELS_ABI=1;";
     public static final int TEXT_INPUT = 1, CLIPBOARD = 2, NOTIFICATIONS = 3, VOLUME = 4,
-            BRIGHTNESS = 5;
+            BRIGHTNESS = 5, MEDIA = 6;
     private final ParcelFileDescriptor descriptor;
     private final InputStream input;
     private final OutputStream output;

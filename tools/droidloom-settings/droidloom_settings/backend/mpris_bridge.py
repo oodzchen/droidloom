@@ -1003,7 +1003,10 @@ class AndroidMprisBridgeManager:
                 target=self._native_socket_loop, daemon=True, name="dl-mpris-native"
             )
             self._native_thread.start()
-        if self._thread is None or not self._thread.is_alive():
+        if (
+            os.environ.get("DROIDLOOM_MPRIS_ADB_FALLBACK") == "1"
+            and (self._thread is None or not self._thread.is_alive())
+        ):
             self._thread = threading.Thread(
                 target=self._supervisor_loop, daemon=True, name="dl-mpris-bridge"
             )
@@ -1146,7 +1149,7 @@ class AndroidMprisBridgeManager:
             try:
                 if (
                     self._native_connected.is_set()
-                    or os.environ.get("DROIDLOOM_MPRIS_ADB_FALLBACK") == "0"
+                    or os.environ.get("DROIDLOOM_MPRIS_ADB_FALLBACK") != "1"
                 ):
                     self._stop_event.wait(2.0)
                     continue

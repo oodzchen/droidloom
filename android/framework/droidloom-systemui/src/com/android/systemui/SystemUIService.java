@@ -20,6 +20,7 @@ public class SystemUIService extends Service {
     private com.android.systemui.wifi.WifiProvisioning wifi;
     private com.android.systemui.levels.HostVolume volume;
     private com.android.systemui.levels.HostBrightness brightness;
+    private com.android.systemui.media.MediaSessionBridge media;
     @Override public void onCreate() {
         super.onCreate();
         if (UserHandle.myUserId() != 0) return;
@@ -40,6 +41,8 @@ public class SystemUIService extends Service {
         volume.start();
         brightness = new com.android.systemui.levels.HostBrightness(this);
         brightness.start();
+        media = new com.android.systemui.media.MediaSessionBridge(this);
+        media.start();
         Log.i("DroidloomSystemUI", "DROIDLOOM_SYSTEMUI_ABI=1; status bar registered; no windows");
     }
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
@@ -51,6 +54,7 @@ public class SystemUIService extends Service {
         if (wifi != null) wifi.close();
         if (volume != null) volume.close();
         if (brightness != null) brightness.close();
+        if (media != null) media.close();
         super.onDestroy();
     }
     @Override public IBinder onBind(Intent intent) { return null; }
@@ -62,5 +66,6 @@ public class SystemUIService extends Service {
         if (notifications != null) notifications.dump(out);
         if (volume != null) volume.dump(out);
         if (brightness != null) brightness.dump(out);
+        if (media != null) media.dump(out);
     }
 }

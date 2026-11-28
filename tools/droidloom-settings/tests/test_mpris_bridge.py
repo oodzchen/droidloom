@@ -361,8 +361,7 @@ class MprisBridgeTests(unittest.TestCase):
             sock_path = Path(tmp) / "media.sock"
             received: list[dict[str, object]] = []
             got_payload = threading.Event()
-            old_fb = os.environ.get("DROIDLOOM_MPRIS_ADB_FALLBACK")
-            os.environ["DROIDLOOM_MPRIS_ADB_FALLBACK"] = "0"
+            old_fb = os.environ.pop("DROIDLOOM_MPRIS_ADB_FALLBACK", None)
             mgr = AndroidMprisBridgeManager(_DummyController(), media_socket_path=sock_path)
             mgr._apply_sessions_payload = lambda payload: (
                 received.append(payload),
@@ -375,6 +374,7 @@ class MprisBridgeTests(unittest.TestCase):
                 {"idle_add": staticmethod(lambda fn, *a: fn(*a))},
             )()
             mgr.start()
+            self.assertIsNone(mgr._thread)
             try:
                 deadline = time.monotonic() + 3.0
                 while not sock_path.exists() and time.monotonic() < deadline:

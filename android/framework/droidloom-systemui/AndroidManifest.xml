@@ -14,6 +14,7 @@
     <uses-permission android:name="android.permission.NETWORK_SETTINGS" />
     <uses-permission android:name="android.permission.CONTROL_DISPLAY_BRIGHTNESS" />
     <uses-permission android:name="android.permission.QUERY_AUDIO_STATE" />
+    <uses-permission android:name="android.permission.MEDIA_CONTENT_CONTROL" />
     <application android:label="Droidloom SystemUI" android:persistent="true"
         android:allowBackup="false" android:allowClearUserData="false"
         android:hardwareAccelerated="false" android:directBootAware="true"

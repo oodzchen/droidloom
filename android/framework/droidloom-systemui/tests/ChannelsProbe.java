@@ -17,12 +17,13 @@ public final class ChannelsProbe {
     public static void main(String[] args) throws Exception {
         if (android.os.Process.myUid() != 2000)
             throw new AssertionError("Run as Android shell UID 2000");
-        for (int channel : new int[] {1, 2, 3, 0, 255}) denied(channel);
+        for (int channel : new int[] {1, 2, 3, 4, 5, 6, 0, 255}) denied(channel);
         int before = new File("/proc/self/fd").list().length;
-        for (int i = 0; i < 32; i++) denied(1 + i % 3);
+        for (int i = 0; i < 32; i++) denied(1 + i % 6);
         int after = new File("/proc/self/fd").list().length;
         if (after > before) throw new AssertionError("Denied delegation leaked descriptors");
-        for (String name : new String[] {"text-input", "clipboard", "notifications"}) {
+        for (String name : new String[] {
+                "text-input", "clipboard", "notifications", "volume", "brightness", "media"}) {
             try (LocalSocket direct = new LocalSocket()) {
                 direct.connect(new LocalSocketAddress("/dev/socket/droidloom-framework-host/" + name,
                         LocalSocketAddress.Namespace.FILESYSTEM));

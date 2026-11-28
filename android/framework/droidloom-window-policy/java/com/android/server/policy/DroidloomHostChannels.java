@@ -87,10 +87,13 @@ final class DroidloomHostChannels {
                 else if (channel == 3 && uid == systemui) name = "notifications";
                 else if (channel == 4 && uid == systemui) name = "volume";
                 else if (channel == 5 && uid == systemui) name = "brightness";
+                else if (channel == 6 && uid == systemui) name = "media";
                 else continue;
                 String path = "/dev/socket/droidloom-framework-host/" + name;
-                // The device brokers keep record boundaries; the presenter streams.
-                int type = channel >= 4 ? LocalSocket.SOCKET_SEQPACKET : LocalSocket.SOCKET_STREAM;
+                // The device brokers keep record boundaries; the presenter and media bridge stream.
+                int type = (channel == 4 || channel == 5)
+                        ? LocalSocket.SOCKET_SEQPACKET
+                        : LocalSocket.SOCKET_STREAM;
                 try (LocalSocket host = new LocalSocket(type)) {
                     host.connect(new LocalSocketAddress(path, LocalSocketAddress.Namespace.FILESYSTEM));
                     if (host.getPeerCredentials().getUid() != Os.stat(path).st_uid)

@@ -360,7 +360,12 @@ impl DevelopmentNetwork {
             record_error(&mut first_error, result);
         }
         if let Some(previous) = self.previous_ipv4_forward.take() {
-            if previous.trim() != "1" {
+            if previous.trim() != "1"
+                && !has_other_forwarding_interfaces(
+                    Path::new(NET_CLASS_DIR),
+                    &self.names.host_interface,
+                )
+            {
                 record_error(
                     &mut first_error,
                     fs::write(IPV4_FORWARD_PATH, previous)
@@ -414,12 +419,19 @@ impl DevelopmentNetwork {
         let forwarding_state = spec.runtime_dir.join(IPV4_FORWARD_STATE_FILE);
         match fs::read_to_string(&forwarding_state) {
             Ok(previous) => {
-                record_error(
-                    &mut first_error,
-                    fs::write(IPV4_FORWARD_PATH, previous).map_err(|source| {
-                        io_error("restore stale host IPv4 forwarding state", source)
-                    }),
-                );
+                if previous.trim() != "1"
+                    && !has_other_forwarding_interfaces(
+                        Path::new(NET_CLASS_DIR),
+                        &names.host_interface,
+                    )
+                {
+                    record_error(
+                        &mut first_error,
+                        fs::write(IPV4_FORWARD_PATH, previous).map_err(|source| {
+                            io_error("restore stale host IPv4 forwarding state", source)
+                        }),
+                    );
+                }
                 record_error(
                     &mut first_error,
                     remove_file_if_present(
@@ -626,6 +638,32 @@ fn link_exists(interface: &str) -> bool {
     Path::new(NET_CLASS_DIR).join(interface).exists()
 }
 
+fn has_other_forwarding_interfaces(net_class_dir: &Path, own_interface: &str) -> bool {
+    let Ok(entries) = fs::read_dir(net_class_dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return false;
+        };
+        if name == own_interface {
+            return false;
+        }
+        [
+            "dlh",
+            "docker",
+            "podman",
+            "cni-",
+            "virbr",
+            "wg",
+            "tailscale",
+            "br-",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    })
+}
+
 fn remove_file_if_present(path: &Path, context: &str) -> Result<(), DevelopmentError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -810,5 +848,21 @@ mod tests {
             crate::adb::init_policy_for(&cell)
                 .contains("setprop service.adb.listen_addrs tcp:localhost:5555")
         );
+    }
+
+    #[test]
+    fn forwarding_teardown_respects_other_forwarding_interfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("dlh1000")).unwrap();
+        fs::create_dir(dir.path().join("wlo1")).unwrap();
+        fs::create_dir(dir.path().join("lo")).unwrap();
+        assert!(!has_other_forwarding_interfaces(dir.path(), "dlh1000"));
+
+        for other in ["docker0", "virbr0", "wg0", "dlh1001"] {
+            let path = dir.path().join(other);
+            fs::create_dir(&path).unwrap();
+            assert!(has_other_forwarding_interfaces(dir.path(), "dlh1000"));
+            fs::remove_dir(&path).unwrap();
+        }
     }
 }

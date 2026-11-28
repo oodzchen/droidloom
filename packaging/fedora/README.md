@@ -8,7 +8,7 @@ with KDE Plasma Wayland (`kwin_wayland`), SELinux (`Enforcing`), and `firewalld`
 - [Containerfile](Containerfile): Rootless Fedora 45 builder image for compiling host binaries, `droidloom-update`, SELinux policy modules, and RPMs.
 - [droidloom-image.spec](droidloom-image.spec): RPM spec packaging `/usr/lib/droidloom/{runtime,storage,images,current}`.
 - [droidloom-runtime.spec](droidloom-runtime.spec): RPM spec packaging host binaries, systemd units, SELinux module, `firewalld` rules, and architecture-specific Fedora overrides.
-- [selinux/droidloom_fedora.te](selinux/droidloom_fedora.te): Type Enforcement policy allowing `binder` IPC, `mac_admin`/`mac_override`, container entrypoint labels, and tmpfs/pseudofs association under `unconfined_t` / `unconfined_service_t`.
+- [selinux/droidloom_fedora.te](selinux/droidloom_fedora.te) & [selinux/droidloom_fedora.fc](selinux/droidloom_fedora.fc): Type Enforcement policy confining `droidloomd` and the Android cell to a dedicated `droidloom_t` / `droidloom_exec_t` domain (removing `binder`, `mac_admin`/`mac_override`, and container `entrypoint` grants from `unconfined_t` / `unconfined_service_t`), plus tmpfs/pseudofs association.
 - [firewalld/zones/droidloom.xml](firewalld/zones/droidloom.xml) & [firewalld/policies/droidloom-egress.xml](firewalld/policies/droidloom-egress.xml): Outbound NAT/forwarding zone and policy for Droidloom veth interfaces (`dlh+`, `10.177.0.0/30`).
 - [density-desktop.json](density-desktop.json): Sample `$XDG_CONFIG_HOME/droidloom/density-v1.json` setting `dpiPerScale: 160` so `1 Android dp` matches `1 Wayland logical pixel`.
 - [braun/](braun/): `libcamera`-backed `org.braun.Camera1` system service (`droidloom-braun`) bridging host cameras to `droidloom-devices` and Android's camera HAL.
@@ -20,7 +20,7 @@ with KDE Plasma Wayland (`kwin_wayland`), SELinux (`Enforcing`), and `firewalld`
 
 ```sh
 checkmodule -M -m -o droidloom_fedora.mod packaging/fedora/selinux/droidloom_fedora.te
-semodule_package -o droidloom_fedora.pp -m droidloom_fedora.mod
+semodule_package -o droidloom_fedora.pp -m droidloom_fedora.mod -f packaging/fedora/selinux/droidloom_fedora.fc
 ```
 
 The `%post` scriptlet in `droidloom-runtime.spec` installs the module with `semodule -i`.

@@ -36,6 +36,7 @@ fi
 
 %post
 /usr/bin/semodule -i /usr/share/selinux/packages/droidloom_fedora.pp
+/usr/sbin/restorecon -F /usr/bin/droidloomd >/dev/null 2>&1 || :
 /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || :
 /usr/bin/firewall-cmd --reload >/dev/null 2>&1 || :
 /usr/lib/droidloom/droidloom-package-helper after-install
@@ -49,6 +50,7 @@ fi
 /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || :
 if [ "$1" -eq 0 ]; then
   /usr/bin/semodule -r droidloom_fedora >/dev/null 2>&1 || :
+  /usr/sbin/restorecon -F /usr/bin/droidloomd >/dev/null 2>&1 || :
   /usr/bin/firewall-cmd --reload >/dev/null 2>&1 || :
 fi
 

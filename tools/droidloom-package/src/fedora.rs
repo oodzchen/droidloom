@@ -495,7 +495,9 @@ pub fn prepare_fedora_stage(
         .arg("-o")
         .arg(&pp_file)
         .arg("-m")
-        .arg(&mod_file))?;
+        .arg(&mod_file)
+        .arg("-f")
+        .arg(repo.join("packaging/fedora/selinux/droidloom_fedora.fc")))?;
 
     let fw_zones = stage_runtime.join("usr/lib/firewalld/zones");
     let fw_policies = stage_runtime.join("usr/lib/firewalld/policies");

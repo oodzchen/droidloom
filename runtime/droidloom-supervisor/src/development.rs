@@ -66,6 +66,28 @@ const PRIVATE_SYSCTL_DIRECTORY: &str = "android-private-sysctls";
 const PRIVATE_NET_CORE_DIRECTORY: &str = "net-core";
 const PRIVATE_BPF_SYSCTLS: [(&str, &str); 2] =
     [("bpf_jit_enable", "1\n"), ("bpf_jit_kallsyms", "1\n")];
+const CAP_LINUX_IMMUTABLE: libc::c_int = 9;
+const CAP_SYS_MODULE: libc::c_int = 16;
+const CAP_SYS_RAWIO: libc::c_int = 17;
+const CAP_SYS_PACCT: libc::c_int = 20;
+const CAP_SYS_BOOT: libc::c_int = 22;
+const CAP_SYS_TIME: libc::c_int = 25;
+const CAP_LEASE: libc::c_int = 28;
+const CAP_AUDIT_READ: libc::c_int = 37;
+const CAP_PERFMON: libc::c_int = 38;
+const CAP_CHECKPOINT_RESTORE: libc::c_int = 40;
+const DROPPED_CELL_CAPABILITIES: &[libc::c_int] = &[
+    CAP_LINUX_IMMUTABLE,
+    CAP_SYS_MODULE,
+    CAP_SYS_RAWIO,
+    CAP_SYS_PACCT,
+    CAP_SYS_BOOT,
+    CAP_SYS_TIME,
+    CAP_LEASE,
+    CAP_AUDIT_READ,
+    CAP_PERFMON,
+    CAP_CHECKPOINT_RESTORE,
+];
 const POWER_SUPPLY_TYPES: [&str; 13] = [
     "Battery",
     "UPS",
@@ -1003,6 +1025,7 @@ pub fn enter_development_cell(spec: &CellSpec) -> Result<(), DevelopmentError> {
     }
     crate::filesystem_guard::install()
         .map_err(|error| io_error("install shared-filesystem protection", error))?;
+    drop_dangerous_host_capabilities()?;
     let error = std::os::unix::process::CommandExt::exec(
         init.arg("second_stage")
             // Android's mount-namespace decision runs before ro.boot.*
@@ -1018,6 +1041,25 @@ pub fn enter_development_cell(spec: &CellSpec) -> Result<(), DevelopmentError> {
             .env("LD_PRELOAD", ANDROID_SELINUX_COMPAT_PRELOAD),
     );
     Err(io_error("exec Android init", error))
+}
+
+fn drop_dangerous_host_capabilities() -> Result<(), DevelopmentError> {
+    for &cap in DROPPED_CELL_CAPABILITIES {
+        // SAFETY: PR_CAPBSET_DROP takes a single Linux capability index and
+        // drops it permanently from this process tree's bounding set.
+        let result = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) };
+        if result != 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINVAL) {
+                continue;
+            }
+            return Err(io_error(
+                "drop host capability from Android cell bounding set",
+                err,
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn arm_android_init_parent_death() -> Result<(), DevelopmentError> {
@@ -3073,5 +3115,28 @@ service netd /system/bin/netd
             "    setenv LD_PRELOAD {ANDROID_SELINUX_COMPAT_PRELOAD}:{HOSTNET_SHIM_PRELOAD}"
         );
         assert_eq!(rendered.matches(&expected_env).count(), 2);
+    }
+
+    #[test]
+    fn dropped_cell_capabilities_exclude_android_required_caps() {
+        for dangerous in [
+            CAP_LINUX_IMMUTABLE,
+            CAP_SYS_MODULE,
+            CAP_SYS_RAWIO,
+            CAP_SYS_PACCT,
+            CAP_SYS_BOOT,
+            CAP_SYS_TIME,
+            CAP_LEASE,
+            CAP_AUDIT_READ,
+            CAP_PERFMON,
+            CAP_CHECKPOINT_RESTORE,
+        ] {
+            assert!(DROPPED_CELL_CAPABILITIES.contains(&dangerous));
+        }
+        for required in [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 21, 23, 30, 32, 33, 34, 35, 39,
+        ] {
+            assert!(!DROPPED_CELL_CAPABILITIES.contains(&required));
+        }
     }
 }

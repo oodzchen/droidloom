@@ -1,8 +1,28 @@
-module droidloom_fedora 1.1;
+module droidloom_fedora 2.0;
 
 require {
-    type unconfined_service_t;
-    type unconfined_t;
+    role system_r;
+    role unconfined_r;
+    role object_r;
+    attribute domain;
+    attribute unconfined_domain_type;
+    attribute files_unconfined_type;
+    attribute filesystem_unconfined_type;
+    attribute corenet_unconfined_type;
+    attribute devices_unconfined_type;
+    attribute kern_unconfined;
+    attribute process_uncond_exempt;
+    attribute dbusd_unconfined;
+    attribute system_bus_type;
+    attribute file_type;
+    attribute exec_type;
+    attribute entry_type;
+    attribute non_security_file_type;
+    type init_t;
+    type system_dbusd_t;
+    type bin_t;
+    type lib_t;
+    type usr_t;
     type unlabeled_t;
     type tmpfs_t;
     type var_lib_t;
@@ -12,19 +32,56 @@ require {
     type cgroup_t;
     class binder { call impersonate set_context_mgr transfer };
     class capability2 { mac_admin mac_override };
-    class file { entrypoint };
+    class dbus { send_msg };
+    class fd { use };
+    class fifo_file { getattr ioctl read write };
+    class file { entrypoint execute getattr open read };
     class filesystem { associate };
+    class process { noatsecure rlimitinh sigchld siginh sigkill signal signull sigstop transition };
+    class unix_dgram_socket { getattr getopt ioctl read sendto setopt shutdown write };
+    class unix_stream_socket { connectto getattr getopt ioctl read sendto setopt shutdown write };
 }
 
-allow unconfined_service_t self:binder { call impersonate set_context_mgr transfer };
-allow unconfined_t self:binder { call impersonate set_context_mgr transfer };
-allow unconfined_service_t unconfined_t:binder { call impersonate set_context_mgr transfer };
-allow unconfined_t unconfined_service_t:binder { call impersonate set_context_mgr transfer };
+type droidloom_t;
+type droidloom_exec_t;
 
-allow unconfined_service_t self:capability2 { mac_admin mac_override };
-allow unconfined_t self:capability2 { mac_admin mac_override };
+role system_r types droidloom_t;
+role unconfined_r types droidloom_t;
+role object_r types droidloom_exec_t;
 
-allow unconfined_service_t { unlabeled_t tmpfs_t var_lib_t }:file entrypoint;
-allow unconfined_t { unlabeled_t tmpfs_t var_lib_t }:file entrypoint;
+typeattribute droidloom_t domain;
+typeattribute droidloom_t unconfined_domain_type;
+typeattribute droidloom_t files_unconfined_type;
+typeattribute droidloom_t filesystem_unconfined_type;
+typeattribute droidloom_t corenet_unconfined_type;
+typeattribute droidloom_t devices_unconfined_type;
+typeattribute droidloom_t kern_unconfined;
+typeattribute droidloom_t process_uncond_exempt;
+typeattribute droidloom_t dbusd_unconfined;
+
+typeattribute droidloom_exec_t file_type;
+typeattribute droidloom_exec_t exec_type;
+typeattribute droidloom_exec_t entry_type;
+typeattribute droidloom_exec_t non_security_file_type;
+
+# Transition systemd (init_t) -> droidloom_t when executing /usr/bin/droidloomd.
+type_transition init_t droidloom_exec_t:process droidloom_t;
+allow init_t droidloom_exec_t:file { execute getattr open read };
+allow init_t droidloom_t:process { noatsecure rlimitinh siginh sigkill signal signull sigstop transition };
+allow init_t droidloom_t:dbus send_msg;
+allow droidloom_t init_t:dbus send_msg;
+allow droidloom_t init_t:fd use;
+allow droidloom_t init_t:fifo_file { getattr ioctl read write };
+allow droidloom_t init_t:unix_stream_socket { connectto getattr getopt ioctl read sendto setopt shutdown write };
+allow droidloom_t init_t:unix_dgram_socket { getattr getopt ioctl read sendto setopt shutdown write };
+allow droidloom_t init_t:process sigchld;
+allow droidloom_t system_dbusd_t:dbus send_msg;
+allow droidloom_t system_bus_type:dbus send_msg;
+allow system_bus_type droidloom_t:dbus send_msg;
+
+# Droidloom-only kernel permissions (removed from unconfined_t and unconfined_service_t).
+allow droidloom_t self:binder { call impersonate set_context_mgr transfer };
+allow droidloom_t self:capability2 { mac_admin mac_override };
+allow droidloom_t { droidloom_exec_t bin_t lib_t usr_t unlabeled_t tmpfs_t var_lib_t }:file entrypoint;
 
 allow unlabeled_t { devpts_t proc_t sysfs_t cgroup_t }:filesystem associate;

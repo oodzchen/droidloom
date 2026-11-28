@@ -18,7 +18,7 @@ use std::{
     },
     path::PathBuf,
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use zbus::{
     Connection, MatchRule, Message, MessageStream, Proxy, message::Type,
@@ -310,6 +310,15 @@ impl Peer {
 }
 const EXCESS_NOTIFICATION_GENERATION: &str =
     "org.freedesktop.Notifications.Error.ExcessNotificationGeneration";
+const RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_millis(1050);
+const MAX_RATE_LIMIT_RETRIES: u8 = 3;
+
+#[derive(Clone, Copy, Debug)]
+struct PendingRetry {
+    due: Instant,
+    quiet: bool,
+    attempts: u8,
+}
 
 #[derive(Default, Serialize, Deserialize)]
 struct Record {
@@ -322,6 +331,8 @@ struct Record {
     dismissed: bool,
     #[serde(skip)]
     note: Option<Note>,
+    #[serde(skip)]
+    pending_retry: Option<PendingRetry>,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct State {
@@ -351,6 +362,7 @@ impl State {
                 record.id = None;
                 record.last_id = None;
                 record.hidden = false;
+                record.pending_retry = None;
             }
         }
     }
@@ -471,6 +483,7 @@ async fn reconcile(
     snapshot: BTreeMap<String, Note>,
     desktop: &Desktop<'_>,
     desktop_forwarding: bool,
+    retry_delay: Duration,
 ) -> Result<()> {
     let removed: Vec<_> = state
         .records
@@ -486,7 +499,16 @@ async fn reconcile(
         }
     }
     for (key, note) in snapshot {
-        upsert(state, key, note, desktop, true, desktop_forwarding).await?;
+        upsert(
+            state,
+            key,
+            note,
+            desktop,
+            true,
+            desktop_forwarding,
+            retry_delay,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -509,6 +531,83 @@ fn same_presentation(a: &Note, b: &Note) -> bool {
         && a.large_icon == b.large_icon
         && a.messages == b.messages
 }
+fn schedule_rate_limit_retry(
+    record: &mut Record,
+    quiet: bool,
+    retry_delay: Duration,
+    next_attempt: u8,
+) {
+    record.pending_retry = (next_attempt <= MAX_RATE_LIMIT_RETRIES).then(|| PendingRetry {
+        due: Instant::now() + retry_delay,
+        quiet,
+        attempts: next_attempt,
+    });
+}
+async fn deliver_desktop_notify(
+    record: &mut Record,
+    note: &Note,
+    desktop: &Desktop<'_>,
+    quiet: bool,
+    retry_delay: Duration,
+    next_attempt: u8,
+) -> Result<bool> {
+    let replaces = record.id.unwrap_or(0);
+    match desktop.notify(note, replaces, quiet).await {
+        Ok(id) => {
+            record.id = Some(id);
+            record.last_id = None;
+            record.pending_retry = None;
+            Ok(true)
+        }
+        Err(zbus::Error::MethodError(name, msg, _))
+            if name.as_str() == EXCESS_NOTIFICATION_GENERATION =>
+        {
+            // Preserve existing desktop ID mapping so action buttons on the
+            // currently displayed notification remain functional.
+            eprintln!(
+                "Droidloom notifications: desktop Notify rate-limited ({name}: {})",
+                msg.as_deref().unwrap_or("")
+            );
+            schedule_rate_limit_retry(record, quiet, retry_delay, next_attempt);
+            Ok(false)
+        }
+        Err(zbus::Error::MethodError(name, msg, _)) => {
+            if replaces != 0 {
+                match desktop.notify(note, 0, quiet).await {
+                    Ok(id) => {
+                        record.id = Some(id);
+                        record.last_id = None;
+                        record.pending_retry = None;
+                        Ok(true)
+                    }
+                    Err(zbus::Error::MethodError(retry_name, retry_msg, _)) => {
+                        eprintln!(
+                            "Droidloom notifications: desktop Notify rejected ({retry_name}: {})",
+                            retry_msg.as_deref().unwrap_or("")
+                        );
+                        if retry_name.as_str() == EXCESS_NOTIFICATION_GENERATION {
+                            schedule_rate_limit_retry(record, quiet, retry_delay, next_attempt);
+                        } else {
+                            record.id = None;
+                            record.pending_retry = None;
+                        }
+                        Ok(false)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            } else {
+                eprintln!(
+                    "Droidloom notifications: desktop Notify rejected ({name}: {})",
+                    msg.as_deref().unwrap_or("")
+                );
+                record.id = None;
+                record.pending_retry = None;
+                Ok(false)
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
 async fn upsert(
     state: &mut State,
     key: String,
@@ -516,6 +615,7 @@ async fn upsert(
     desktop: &Desktop<'_>,
     quiet: bool,
     desktop_forwarding: bool,
+    retry_delay: Duration,
 ) -> Result<()> {
     let record = state.records.entry(key).or_default();
     if record.version != note.version {
@@ -532,58 +632,76 @@ async fn upsert(
             .is_some_and(|prev| same_presentation(prev, &note));
     record.version = note.version.clone();
     record.note = Some(note.clone());
-    if desktop_forwarding
-        && !state.owner.is_empty()
+    if !desktop_forwarding {
+        record.pending_retry = None;
+    } else if !state.owner.is_empty()
         && !record.hidden
         && !unchanged_presentation
         && (changed || record.id.is_none())
     {
-        let replaces = record.id.unwrap_or(0);
-        match desktop.notify(&note, replaces, quiet).await {
-            Ok(id) => {
-                record.id = Some(id);
-                record.last_id = None;
-            }
-            Err(zbus::Error::MethodError(name, msg, _))
-                if name.as_str() == EXCESS_NOTIFICATION_GENERATION =>
-            {
-                // Preserve existing desktop ID mapping so action buttons on the
-                // currently displayed notification remain functional.
-                eprintln!(
-                    "Droidloom notifications: desktop Notify rate-limited ({name}: {})",
-                    msg.as_deref().unwrap_or("")
-                );
-            }
-            Err(zbus::Error::MethodError(name, msg, _)) => {
-                if replaces != 0 {
-                    match desktop.notify(&note, 0, quiet).await {
-                        Ok(id) => {
-                            record.id = Some(id);
-                            record.last_id = None;
-                        }
-                        Err(zbus::Error::MethodError(retry_name, retry_msg, _)) => {
-                            eprintln!(
-                                "Droidloom notifications: desktop Notify rejected ({retry_name}: {})",
-                                retry_msg.as_deref().unwrap_or("")
-                            );
-                            if retry_name.as_str() != EXCESS_NOTIFICATION_GENERATION {
-                                record.id = None;
-                            }
-                        }
-                        Err(error) => return Err(error.into()),
-                    }
-                } else {
-                    eprintln!(
-                        "Droidloom notifications: desktop Notify rejected ({name}: {})",
-                        msg.as_deref().unwrap_or("")
-                    );
-                    record.id = None;
-                }
-            }
-            Err(error) => return Err(error.into()),
-        }
+        deliver_desktop_notify(record, &note, desktop, quiet, retry_delay, 1).await?;
     }
     Ok(())
+}
+fn next_retry_deadline(state: &State) -> Option<Instant> {
+    state
+        .records
+        .values()
+        .filter_map(|record| record.pending_retry.map(|pending| pending.due))
+        .min()
+}
+async fn wait_retry(deadline: Option<Instant>) -> Event {
+    let Some(due) = deadline else {
+        return future::pending().await;
+    };
+    async_io::Timer::after(due.saturating_duration_since(Instant::now())).await;
+    Event::Retry
+}
+async fn flush_due_retries(
+    state: &mut State,
+    desktop: &Desktop<'_>,
+    desktop_forwarding: bool,
+    retry_delay: Duration,
+) -> Result<bool> {
+    let now = Instant::now();
+    let due_keys: Vec<String> = state
+        .records
+        .iter()
+        .filter_map(|(key, record)| {
+            record
+                .pending_retry
+                .filter(|pending| pending.due <= now)
+                .map(|_| key.clone())
+        })
+        .collect();
+    let mut changed = false;
+    for key in due_keys {
+        let Some(record) = state.records.get_mut(&key) else {
+            continue;
+        };
+        let Some(pending) = record.pending_retry.take() else {
+            continue;
+        };
+        if !desktop_forwarding || state.owner.is_empty() || record.hidden || record.dismissed {
+            continue;
+        }
+        let Some(note) = record.note.clone() else {
+            continue;
+        };
+        if deliver_desktop_notify(
+            record,
+            &note,
+            desktop,
+            pending.quiet,
+            retry_delay,
+            pending.attempts.saturating_add(1),
+        )
+        .await?
+        {
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 #[derive(Clone)]
 struct PanelSnapshot {
@@ -768,6 +886,7 @@ enum Event {
     Signal(Option<zbus::Result<Message>>),
     Owner(Option<zbus::Result<Message>>),
     Panel(Option<PanelCommand>),
+    Retry,
 }
 async fn read_peer(peer: Option<&Peer>) -> Event {
     let Some(peer) = peer else {
@@ -799,6 +918,24 @@ async fn serve(
     conn: Connection,
     peer_uid: u32,
     grants: &HostGrants,
+) -> Result<()> {
+    serve_with_retry_delay(
+        listener,
+        state_path,
+        conn,
+        peer_uid,
+        grants,
+        RATE_LIMIT_RETRY_DELAY,
+    )
+    .await
+}
+async fn serve_with_retry_delay(
+    listener: &Async<UnixListener>,
+    state_path: &PathBuf,
+    conn: Connection,
+    peer_uid: u32,
+    grants: &HostGrants,
+    retry_delay: Duration,
 ) -> Result<()> {
     let rule = MatchRule::builder()
         .msg_type(Type::Signal)
@@ -882,7 +1019,10 @@ async fn serve(
                     async { Event::Signal(signals.next().await) },
                     async { Event::Owner(owners.next().await) },
                 ),
-                async { Event::Panel(panel_rx.recv().await.ok()) },
+                future::race(
+                    async { Event::Panel(panel_rx.recv().await.ok()) },
+                    wait_retry(next_retry_deadline(&state)),
+                ),
             ),
         )
         .await;
@@ -938,8 +1078,14 @@ async fn serve(
                         for update in snapshots {
                             match update {
                                 Update::Snapshot(snapshot) => {
-                                    reconcile(&mut state, snapshot, &desktop, desktop_forwarding)
-                                        .await?;
+                                    reconcile(
+                                        &mut state,
+                                        snapshot,
+                                        &desktop,
+                                        desktop_forwarding,
+                                        retry_delay,
+                                    )
+                                    .await?;
                                 }
                                 Update::Post(note) => {
                                     upsert(
@@ -949,6 +1095,7 @@ async fn serve(
                                         &desktop,
                                         false,
                                         desktop_forwarding,
+                                        retry_delay,
                                     )
                                     .await?;
                                 }
@@ -1026,7 +1173,14 @@ async fn serve(
                     .iter()
                     .filter_map(|(k, r)| r.note.clone().map(|n| (k.clone(), n)))
                     .collect();
-                reconcile(&mut state, snapshot, &desktop, desktop_forwarding).await?;
+                reconcile(
+                    &mut state,
+                    snapshot,
+                    &desktop,
+                    desktop_forwarding,
+                    retry_delay,
+                )
+                .await?;
                 state.save(state_path)?;
             }
             Event::Signal(Some(Ok(message))) => {
@@ -1084,6 +1238,7 @@ async fn serve(
                             // Plasma's notification history still resolve to this record.
                             record.last_id = (reason == 1).then_some(id);
                             record.hidden = true;
+                            record.pending_retry = None;
                             if reason == 2 {
                                 if let (Some(note), Some(p)) = (&record.note, &peer) {
                                     if note.clearable && p.command(note, None).await.is_err() {
@@ -1151,6 +1306,7 @@ async fn serve(
                             record.last_id = None;
                             record.hidden = true;
                             record.dismissed = true;
+                            record.pending_retry = None;
                             let _ = state.save(state_path);
                         }
                     }
@@ -1208,6 +1364,7 @@ async fn serve(
                                 record.last_id = None;
                                 record.hidden = true;
                                 record.dismissed = true;
+                                record.pending_retry = None;
                             }
                         }
                     }
@@ -1239,6 +1396,7 @@ async fn serve(
                         desktop_forwarding = enabled;
                         if !desktop_forwarding {
                             for record in state.records.values_mut() {
+                                record.pending_retry = None;
                                 if let Some(id) = record.id.take() {
                                     desktop.close(id).await;
                                 }
@@ -1252,8 +1410,14 @@ async fn serve(
                                 .iter()
                                 .filter_map(|(k, r)| r.note.clone().map(|n| (k.clone(), n)))
                                 .collect();
-                            let _ =
-                                reconcile(&mut state, snapshot, &desktop, desktop_forwarding).await;
+                            let _ = reconcile(
+                                &mut state,
+                                snapshot,
+                                &desktop,
+                                desktop_forwarding,
+                                retry_delay,
+                            )
+                            .await;
                         }
                         let _ = state.save(state_path);
                         publish_panel_state(
@@ -1268,6 +1432,11 @@ async fn serve(
                     let _ = reply.send(desktop_forwarding).await;
                 }
             },
+            Event::Retry => {
+                if flush_due_retries(&mut state, &desktop, desktop_forwarding, retry_delay).await? {
+                    state.save(state_path)?;
+                }
+            }
             Event::Owner(_) | Event::Signal(_) | Event::Panel(None) => {
                 return Err("session bus closed".into());
             }

@@ -897,3 +897,157 @@ fn panel_dbus_interface_snapshot_actions_and_forwarding_toggle() {
         .await;
     });
 }
+
+#[test]
+fn rate_limited_update_retries_and_replaces_with_latest_artwork() {
+    let mut child = Command::new("dbus-daemon")
+        .args(["--session", "--nofork", "--print-address=1"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut address = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut address)
+        .unwrap();
+    let _bus = Bus(child);
+    future::block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notification.sock");
+        let listener = Async::new(UnixListener::bind(&path).unwrap()).unwrap();
+        let (tx, rx) = async_channel::bounded(128);
+        let reject = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .name(NAME)
+            .unwrap()
+            .serve_at(
+                PATH,
+                RateLimitedServer {
+                    next: Arc::new(AtomicU32::new(300)),
+                    reject: reject.clone(),
+                    events: tx,
+                },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let conn = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let state = dir.path().join("state");
+        let grants = HostGrants::default();
+        let bridge = serve_with_retry_delay(
+            &listener,
+            &state,
+            conn,
+            unsafe { libc::getuid() },
+            &grants,
+            Duration::from_millis(60),
+        );
+        let checks = async {
+            let socket = Async::<UnixStream>::connect(&path).await.unwrap();
+            frame(&socket, serde_json::json!({"type":"hello","abi":3})).await;
+            assert_eq!(
+                reply(&socket).await,
+                serde_json::json!({"type":"hello","abi":3})
+            );
+
+            let mut v1 = note("v1");
+            v1.alert = false;
+            v1.ongoing = true;
+            v1.clearable = true;
+            v1.large_icon = "11".repeat(96 * 96 * 4);
+            snapshot(&socket, &[v1.clone()]).await;
+            assert!(matches!(
+                timeout(rx.recv()).await.unwrap(),
+                Observed::Posted(300, 0, ..)
+            ));
+
+            // Rate-limit the artwork update.
+            reject.store(true, Ordering::SeqCst);
+            let mut v2 = v1.clone();
+            v2.version = "v2".into();
+            v2.large_icon = "22".repeat(96 * 96 * 4);
+            frame(
+                &socket,
+                serde_json::json!({"type":"post","notification":v2}),
+            )
+            .await;
+            assert!(
+                future::race(
+                    async {
+                        let _ = rx.recv().await;
+                        true
+                    },
+                    async {
+                        async_io::Timer::after(Duration::from_millis(25)).await;
+                        false
+                    },
+                )
+                .await
+                    == false
+            );
+
+            // An identical presentation bump while retry is pending must preserve the retry.
+            let mut v3 = v2.clone();
+            v3.version = "v3".into();
+            v3.when += 500;
+            frame(
+                &socket,
+                serde_json::json!({"type":"post","notification":v3}),
+            )
+            .await;
+
+            // Unblock desktop Notify and verify the retry replaces ID 300 with v2/v3 artwork.
+            reject.store(false, Ordering::SeqCst);
+            match timeout(rx.recv()).await.unwrap() {
+                Observed::Posted(id, replaces, _, _, hints, _) => {
+                    assert_eq!(id, 300);
+                    assert_eq!(replaces, 300);
+                    let (_, _, _, _, _, _, pixels) =
+                        <(i32, i32, i32, bool, i32, i32, Vec<u8>)>::try_from(
+                            hints.get("image-data").unwrap().clone(),
+                        )
+                        .unwrap();
+                    assert_eq!(pixels, hex::decode(&v2.large_icon).unwrap());
+                }
+                other @ Observed::Closed(_) => panic!("expected retry Post, got {other:?}"),
+            }
+
+            // Closing the notification cancels any pending retry so it does not resurface.
+            reject.store(true, Ordering::SeqCst);
+            let mut v4 = v3.clone();
+            v4.version = "v4".into();
+            v4.large_icon = "33".repeat(96 * 96 * 4);
+            frame(
+                &socket,
+                serde_json::json!({"type":"post","notification":v4}),
+            )
+            .await;
+            server
+                .emit_signal(
+                    None::<&str>,
+                    PATH,
+                    NAME,
+                    "NotificationClosed",
+                    &(300u32, 2u32),
+                )
+                .await
+                .unwrap();
+            let _ = reply(&socket).await;
+            reject.store(false, Ordering::SeqCst);
+            quiet(&rx).await;
+        };
+        future::race(
+            async {
+                bridge.await.unwrap();
+                panic!("bridge stopped")
+            },
+            checks,
+        )
+        .await;
+    });
+}

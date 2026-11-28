@@ -205,10 +205,11 @@ fn execute(args: Args) -> Result<()> {
             );
         }
         Some(Action::HostBuild { work, sysroot }) => {
-            let capacity = std::thread::available_parallelism()
-                .map(|n| n.get().saturating_sub(2).max(1))
+            let avail = std::thread::available_parallelism()
+                .map(|n| n.get())
                 .unwrap_or(1);
-            let jobs = args.jobs.unwrap_or(capacity).min(capacity);
+            let max_jobs = avail.saturating_sub(util::reserved_cpu_count(avail)).max(1);
+            let jobs = args.jobs.unwrap_or_else(util::default_build_jobs).min(max_jobs);
             assemble::host_build(&repository(args.source.clone())?, work, sysroot, jobs)?;
             return Ok(());
         }
@@ -327,10 +328,12 @@ fn execute(args: Args) -> Result<()> {
             "run as the desktop user; administrator authentication is requested only for installation",
         );
     }
-    let capacity = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
+    let avail = std::thread::available_parallelism()
+        .map(|n| n.get())
         .unwrap_or(1);
-    let jobs = args.jobs.unwrap_or(capacity).min(capacity);
+    let reserved_cpus = util::reserved_cpu_count(avail);
+    let max_jobs = avail.saturating_sub(reserved_cpus).max(1);
+    let jobs = args.jobs.unwrap_or_else(util::default_build_jobs).min(max_jobs);
     if jobs == 0 {
         return fail("jobs must be positive");
     }
@@ -425,7 +428,9 @@ fn execute(args: Args) -> Result<()> {
     }
     let identity = bundle::source_identity(&repo)?;
     eprintln!("Building complete Droidloom release from {identity}");
-    eprintln!("Compiler budget: {jobs} parallel jobs; two logical CPUs reserved");
+    eprintln!(
+        "Compiler budget: {jobs} parallel jobs; {reserved_cpus} logical CPUs reserved"
+    );
     let mut host_build = Command::new("cargo");
     host_build
         .current_dir(&repo)

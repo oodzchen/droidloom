@@ -317,12 +317,37 @@ fn compiler_cpus() -> Result<Vec<usize>> {
         .collect();
     if cpus.len() < 3 {
         return Err(
-            "At least three available logical CPUs are needed to keep two free while compiling."
+            "At least three available logical CPUs are needed to keep host cores free while compiling."
                 .into(),
         );
     }
-    cpus.truncate(cpus.len() - 2);
+    // Reserve low-numbered P-cores / IRQ cores first so desktop and WiFi IRQs stay responsive.
+    let reserve = if cpus.len() > 8 {
+        (cpus.len() / 4).max(2).min(cpus.len() - 1)
+    } else {
+        2
+    };
+    cpus.drain(..reserve);
     Ok(cpus)
+}
+pub(crate) fn apply_container_resource_limits(container: &mut Command) {
+    container.args(["--cpu-shares", "256"]);
+    let uid = unsafe { libc::getuid() };
+    let cg_controllers = format!("/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/cgroup.controllers");
+    let has_memory_ctrl = fs::read_to_string(cg_controllers)
+        .map(|s| s.split_whitespace().any(|c| c == "memory"))
+        .unwrap_or(false);
+    if has_memory_ctrl
+        && let Ok(meminfo) = fs::read_to_string("/proc/meminfo")
+        && let Some(mem_kb) = meminfo
+            .lines()
+            .find(|line| line.starts_with("MemTotal:"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|val| val.parse::<usize>().ok())
+    {
+        let limit_mb = ((mem_kb / 1024) * 65 / 100).max(4096);
+        container.arg("--memory").arg(format!("{limit_mb}m"));
+    }
 }
 fn podman(work: &Path) -> Command {
     let mut command = Command::new("podman");
@@ -541,6 +566,7 @@ fn build(
     container
         .args(["run", "--rm", "--userns=keep-id", "--user"])
         .arg(format!("{uid}:{gid}"));
+    apply_container_resource_limits(&mut container);
     if cpuset {
         container.arg("--cpuset-cpus").arg(
             cpus.iter()

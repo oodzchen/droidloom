@@ -18,6 +18,35 @@ pub fn run(command: &mut Command) -> Result<()> {
     }
     Ok(())
 }
+pub fn reserved_cpu_count(total: usize) -> usize {
+    if let Ok(raw) = std::env::var("DROIDLOOM_BUILD_RESERVE_CPUS")
+        && let Ok(val) = raw.trim().parse::<usize>()
+    {
+        return val.min(total.saturating_sub(1));
+    }
+    if total > 8 {
+        (total / 4).max(2).min(total.saturating_sub(1))
+    } else {
+        total.saturating_sub(1).min(2)
+    }
+}
+pub fn default_build_jobs() -> usize {
+    let avail = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let cpu_budget = avail.saturating_sub(reserved_cpu_count(avail)).max(1);
+    let mem_budget = fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|line| line.starts_with("MemTotal:"))
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|val| val.parse::<usize>().ok())
+        })
+        .map(|mem_kb| ((mem_kb / (1024 * 1024)) / 3).max(2))
+        .unwrap_or(cpu_budget);
+    cpu_budget.min(mem_budget).max(1)
+}
 /// Bound the complete compiler process tree, including nested Ninja and JVM workers.
 pub fn run_build(command: &mut Command) -> Result<()> {
     if std::env::var_os("DROIDLOOM_COMPILER_CPUS_RESERVED").as_deref()
@@ -32,23 +61,43 @@ pub fn run_build(command: &mut Command) -> Result<()> {
         return Err(std::io::Error::last_os_error().into());
     }
     let cpus: Vec<_> = (0..libc::CPU_SETSIZE as usize)
-        .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &allowed) })
+        .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &mask_or_allowed(&allowed)) })
         .collect();
-    for &cpu in cpus.iter().rev().take(cpus.len().saturating_sub(1).min(2)) {
+    // Reserve low-numbered P-cores / IRQ cores first so desktop and WiFi IRQs stay responsive.
+    for &cpu in cpus.iter().take(reserved_cpu_count(cpus.len())) {
         unsafe { libc::CPU_CLR(cpu, &mut allowed) };
     }
     command.env("DROIDLOOM_COMPILER_CPUS_RESERVED", "1");
-    // SAFETY: the callback performs only the async-signal-safe affinity syscall;
+    // SAFETY: the callback performs only async-signal-safe syscalls;
     // all allocation and mask construction happened before fork.
     unsafe {
         command.pre_exec(move || {
             if libc::sched_setaffinity(0, std::mem::size_of_val(&allowed), &allowed) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            let _ = libc::setpriority(libc::PRIO_PROCESS, 0, 15);
+            if libc::syscall(
+                libc::SYS_ioprio_set,
+                1i32,
+                0i32,
+                3i32 << 13,
+            ) != 0
+            {
+                let _ = libc::syscall(
+                    libc::SYS_ioprio_set,
+                    1i32,
+                    0i32,
+                    (2i32 << 13) | 7i32,
+                );
+            }
             Ok(())
         });
     }
     run(command)
+}
+#[inline]
+unsafe fn mask_or_allowed(allowed: &libc::cpu_set_t) -> libc::cpu_set_t {
+    *allowed
 }
 pub fn output(command: &mut Command) -> Result<String> {
     let out = command.stdin(Stdio::null()).output()?;
@@ -225,8 +274,9 @@ mod tests {
 mod affinity_tests {
     use super::*;
     #[test]
-    fn compilation_child_leaves_two_available_cpus_outside_its_affinity() {
+    fn compilation_child_leaves_reserved_cpus_outside_its_affinity() {
         let parent = std::thread::available_parallelism().unwrap().get();
+        let expected_reserved = reserved_cpu_count(parent);
         let d = tempfile::tempdir().unwrap();
         let file = fs::File::create(d.path().join("cpus")).unwrap();
         run_build(Command::new("nproc").stdout(Stdio::from(file))).unwrap();
@@ -235,7 +285,14 @@ mod affinity_tests {
             .trim()
             .parse()
             .unwrap();
-        assert_eq!(child, parent.saturating_sub(2).max(1));
+        assert_eq!(child, parent.saturating_sub(expected_reserved).max(1));
         assert_eq!(std::thread::available_parallelism().unwrap().get(), parent);
+    }
+
+    #[test]
+    fn reserved_cpu_count_scales_with_host_cores() {
+        assert_eq!(reserved_cpu_count(4), 2);
+        assert_eq!(reserved_cpu_count(8), 2);
+        assert_eq!(reserved_cpu_count(16), 4);
     }
 }

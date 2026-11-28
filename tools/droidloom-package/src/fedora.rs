@@ -205,6 +205,7 @@ pub fn build_rpm(
             "--user",
         ])
         .arg(format!("{uid}:{gid}"));
+    super::apply_container_resource_limits(&mut container);
     for var in [
         "http_proxy",
         "https_proxy",
